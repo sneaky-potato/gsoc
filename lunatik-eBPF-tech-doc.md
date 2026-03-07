@@ -19,7 +19,7 @@ easier will be a better value addition to Lunatik ecosystem.
 
 ## Project Description
 
-### Background: The Problem With eBPF Alone
+### The Problem With eBPF Alone
 
 eBPF has become the dominant mechanism for extending the Linux kernel at
 runtime. It is fast, safe (verifier-enforced), and increasingly expressive. But
@@ -35,7 +35,7 @@ scripting language that extends a host system without replacing it. eBPF and
 Lua are not competitors we can make them complementary tools for different parts of
 the same problem.
 
-### Core Idea: eBPF as Structure, Lua as Policy
+### Idea: eBPF as Structure, Lua as Policy
 
 The design philosophy of this project follows the pattern established by `luaxdp`:
 
@@ -51,16 +51,16 @@ flowchart LR
     A[NIC] --> B[eBFP hook]
     B --> C[eBPF program]
     C --> D[bpf_lunatik_run kfunc]
-    D --> F[Lunatik runtime]
+    D --> F[Lunatik]
     F --> G[Lua callback]
-    G --> H[verdict returned to eBPF program]
+    G --> H[verdict returned]
 ```
 
 Currently, `luaxdp` implements this pattern but it is **tightly coupled to XDP**. 
 The kfunc `bpf_luaxdp_run()` is registered only for `BPF_PROG_TYPE_XDP` and 
 receives an `xdp_md` context. 
 
-This project generalizes that design.
+This project aims to generalize that design.
 
 ---
 
@@ -69,7 +69,6 @@ This project generalizes that design.
 Shared internal function that any type-specific kfunc can call:
 
 ```c
-// lunatik_bpf.h (internal)
 typedef int (*lunatik_bpf_cb)(lua_State *L, void *ctx);
 
 int lunatik_bpf_run(const char *runtime_name, lunatik_bpf_cb push_ctx, void *ctx);
@@ -81,16 +80,16 @@ This function:
 4. Invokes the registered Lua handler
 5. Reads and returns the verdict
 
-Type-specific kfuncs become thin wrappers:
+Type-specific kfuncs then become thin wrappers:
 
 ```c
-// bpf_luaxdp_run refactored, behaviour unchanged
+// bpf_luaxdp_run will get refactored, behaviour unchanged
 __bpf_kfunc int bpf_luaxdp_run(struct xdp_md *ctx, ...)
 {
     return lunatik_bpf_run(runtime, luaxdp_push_ctx, ctx);
 }
 
-// bpf_luatc_run new
+// bpf_luatc_run will be a new addition
 __bpf_kfunc int bpf_luatc_run(struct __sk_buff *skb, ...)
 {
     return lunatik_bpf_run(runtime, luatc_push_ctx, skb);
@@ -105,8 +104,7 @@ Each kfunc is registered for its specific `bpf_prog_type` via
 ### Component 2: TC Binding (`luatc`)
 
 Traffic Control is the primary demonstration of the generic layer. TC operates
-on `__sk_buff` and is the place in the kernel where several capabilities 
-converge simultaneously:
+on `__sk_buff` and is the place in the kernel with several capabilities:
 
 - `tc_classid`: direct assignment to HTB qdisc classes for traffic shaping
 - `struct bpf_sock *sk`: socket identity, enabling `bpf_skb_cgroup_id()` for
@@ -151,10 +149,81 @@ tc.detach()           -- unregister
 
 ---
 
-### Component 3: DNS-Based Traffic Shaper
+### Component 3: Examples using tc and Lua
 
-This example demonstrates the division of labor between eBPF and Lua, and why
-both are needed.
+1. Multi field egress classification
+
+TC filters classify packets into HTB classes, but existing classifiers (u32, flower) 
+can only match static L3/L4 fields. They cannot combine multiple fields with 
+conditional logic. Operators are forced into this pattern:
+```shell
+iptables -t mangle -A POSTROUTING -p tcp --dport 443 -j MARK --set-mark 0x1
+iptables -t mangle -A POSTROUTING -p udp --dport 53  -j MARK --set-mark 0x1
+tc filter add dev eth0 parent 1:0 handle 0x1 fw classid 1:10
+```
+Problems with this:
+
+- Requires iptables and tc: two subsystems to configure
+- Port-based only, cannot combine port + protocol + packet size + DSCP
+- Static, adding a new rule requires editing iptables and reloading
+- IPv6 variable headers break u32 offset-based matching
+
+This can be conveniently solved via a Lua policy handler.
+
+```lua
+-- qos.lua
+local tc = require("tc")
+
+local policy = {
+    -- realtime: VoIP and gaming
+    {
+        match = function(p)
+            return p.protocol == 0x0800          -- IPv4
+               and p:ip_proto() == 17            -- UDP
+               and p.len < 256                   -- small packet
+               and (p:dscp() == 46               -- DSCP Expedited Forwarding
+                    or p.priority >= 6)          -- SO_PRIORITY high
+        end,
+        classid = 0x00010010   -- 1:10 realtime
+    },
+
+    -- bulk: large TCP segments, likely file transfer or backup
+    {
+        match = function(p)
+            return p.protocol == 0x0800
+               and p:ip_proto() == 6             -- TCP
+               and p.len > 1400                  -- near-MTU = bulk transfer
+               and p.priority == 0               -- no special priority set
+        end,
+        classid = 0x00010030   -- 1:30 bulk
+    },
+
+    -- interactive: SSH, DNS
+    {
+        match = function(p)
+            local dport = p:dst_port()
+            return dport == 22                   -- SSH
+                or dport == 53                   -- DNS
+                or dport == 123                  -- NTP
+        end,
+        classid = 0x00010010   -- 1:10 realtime
+    },
+}
+
+local function handler(pkt)
+    for _, rule in ipairs(policy) do
+        if rule.match(pkt) then
+            pkt.tc_classid = rule.classid
+            return tc.action.OK
+        end
+    end
+    return tc.action.OK
+end
+
+tc.attach(handler)
+```
+
+2. DNS-Based Traffic Shaper
 
 **The problem**: Shape traffic to streaming services (Netflix, YouTube) and
 video conferencing (Zoom) into separate HTB classes, without a userspace
@@ -255,7 +324,6 @@ tc.attach(handler)
 |---|---|---|
 | DNS wire-format name parsing | Verbose, fragile | Natural with `string.char` |
 | Domain pattern matching (`%.zoom%.us$`) | Not possible | Native `string.match` |
-| Dynamic policy table (add rules at runtime) | Not possible | `ipairs(policy)` |
 | Hot-reload policy without BPF reload | Not possible | `lunatik run new_policy` |
 | Set `tc_classid` for HTB shaping | Possible | `pkt.tc_classid = x` |
 
@@ -270,49 +338,41 @@ only where Lua's capabilities are genuinely needed.
 The generic `bpf_lunatik_run()` layer enables future bindings across the eBPF
 program type space. The most compelling candidates, in priority order:
 
-**`BPF_PROG_TYPE_CGROUP_SKB`** — the strongest next candidate after TC.
-cgroup_skb programs receive a `__sk_buff` context identical to TC, operating
-at the cgroup boundary on ingress and egress. This means the `luatc_data`
-userdata can be **directly reused** — a cgroup_skb binding costs almost nothing
-once luatc exists. The use case is per-container bandwidth enforcement with Lua
-policy, directly relevant to OpenWRT and container environments.
+**`BPF_PROG_TYPE_CGROUP_SKB`**: the strongest next candidate after TC.
+`cgroup_skb` programs receive a `__sk_buff` context identical to TC, operating
+at the cgroup boundary on ingress and egress. The use case is per-container 
+bandwidth enforcement with Lua policy.
 
-**`BPF_PROG_TYPE_KPROBE`** — attaches Lua callbacks to arbitrary kernel
+**`BPF_PROG_TYPE_KPROBE`**: attaches Lua callbacks to arbitrary kernel
 function entry/return points. This extends Lunatik from a networking scripting
-tool to a general kernel scripting tool: operators write Lua functions that fire
+tool to a general kernel scripting tool. Write Lua functions that fire
 on scheduler events, file system calls, or memory allocation events and apply
-dynamic policy. This is the kernel scripting vision from the DLS'14 paper
-applied beyond networking.
+dynamic policy.
 
-**`BPF_PROG_TYPE_TRACEPOINT`** — attaches Lua callbacks to pre-defined kernel
+**`BPF_PROG_TYPE_TRACEPOINT`**: attaches Lua callbacks to pre-defined kernel
 tracepoints. Enables scriptable kernel observability: a Lua script processes
 tracing events dynamically, performing aggregation or filtering that would
-require recompiling a BPF program in C today.
+otherwise require recompiling a BPF program.
 
-**`BPF_PROG_TYPE_CGROUP_SOCK_ADDR`** — triggered when a process calls `bind`
+**`BPF_PROG_TYPE_CGROUP_SOCK_ADDR`**: triggered when a process calls `bind`
 or `connect`. With Lua: dynamic connection policy per container, with pattern
 matching on addresses and ports, hot-reloadable without kernel changes.
 
 Each of these is a future binding, not in scope for this GSoC project. But the
-generic `bpf_lunatik_run()` layer makes each of them straightforward to add —
-which is precisely the combinatory effect that justifies the infrastructure
+generic `bpf_lunatik_run()` layer makes each of them straightforward to add.
+This is precisely the combinatory effect that justifies the infrastructure
 investment.
 
 ---
 
 ### Stretch Goal: eBPF Maps Module
 
-Rather than Lunatik → eBPF program loading (which would require in-kernel
-`bpf()` syscall infrastructure that does not exist and contradicts the design
-philosophy), the appropriate stretch goal is an **eBPF maps module for
-Lunatik**.
+To fully use the bpf ecosystem via Lunatik, another value addition would be
+an **eBPF maps module for Lunatik**. This will allow Lunatik to have:
 
-eBPF maps are the shared state mechanism of the eBPF ecosystem. Exposing them
-to Lua scripts enables:
-
-- **Stateful policies**: a Lua DNS handler writes `{ip → classid}` to a map;
+- **Stateful policies**: a Lua DNS handler writes `{ip -> classid}` to a map;
   the eBPF fast path reads it
-- **Cross-binding composition**: `luaxdp` writes to a map that `luatc` reads —
+- **Cross-binding composition**: `luaxdp` writes to a map that `luatc` reads,
   enabling pipelines that span subsystems
 - **Operator visibility**: Lua scripts read kernel maps to inspect state without
   a separate userspace tool
@@ -325,9 +385,6 @@ local classid = flow_table:lookup(dst_ip)
 flow_table:update(src_ip, new_classid)
 flow_table:delete(stale_ip)
 ```
-
-This is the missing piece for stateful composition between Lunatik bindings —
-directly in line with the combinatory philosophy.
 
 ---
 
