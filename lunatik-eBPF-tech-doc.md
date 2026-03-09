@@ -15,6 +15,10 @@ the scripting surface available. `luatc` alone is not the point.
 A generic, reusable `bpf_lunatik_run()` layer that makes every future binding
 easier will be a better value addition to Lunatik ecosystem.
 
+This paired with an API to interact with eBPF maps will complete this project.
+The goal is to make Lunatik compatible with eBPF programs so we can script
+the kernel in more ways.
+
 ---
 
 ## Project Description
@@ -31,30 +35,52 @@ It is an architectural property of eBPF. Complex policy logic, the kind that
 operators actually need does not fit this model.
 
 Enter Lua. Lua is small, embeddable, and designed for exactly this role: a
-scripting language that extends a host system without replacing it. eBPF and
-Lua are not competitors we can make them complementary tools for different parts of
-the same problem.
+scripting language that extends a host system without replacing it. Lua is often
+a glue language for the exisiting architecture. eBPF and Lua are not competitors,
+we can make them complementary tools for different parts of the same problem.
 
 ### Idea: eBPF as Structure, Lua as Policy
 
 The design philosophy of this project follows the pattern established by `luaxdp`:
 
-- **eBPF programs define the points of interest**: fast-path structure,
-  the packet parsing, the conditions under which policy logic is needed.
+```mermaid
+flowchart LR
+
+    NIC[NIC / Packet Source]
+
+    subgraph eBPF Layer
+        TC[TC Hook]
+        BPF[eBPF Program]
+        KFUNC[bpf_lunatik_run kfunc]
+    end
+
+    subgraph Lunatik Layer
+        LUNATIK[Lunatik Runtime]
+        LUA[Lua Policy Handler]
+    end
+
+    NIC --> TC
+    TC --> BPF
+    BPF --> KFUNC
+    KFUNC --> LUNATIK
+    LUNATIK --> LUA
+
+    LUA -->|verdict| LUNATIK
+    LUNATIK -->|return| KFUNC
+    KFUNC --> BPF
+    BPF --> TC
+```
+
+- **eBPF programs define the points of interest**: fast-path, packet parsing,
+  the conditions under which policy logic is needed.
 - **`bpf_lunatik_run()` is the weaving point**: execution suspends, control
   passes to Lua, a verdict is returned, execution resumes.
 - **Lua scripts define the policy**: string matching, pattern tables, dynamic
   rules, hot-reloadable without recompiling or reloading any BPF program.
 
-```mermaid
-flowchart LR
-    A[NIC] --> B[eBFP hook]
-    B --> C[eBPF program]
-    C --> D[bpf_lunatik_run kfunc]
-    D --> F[Lunatik]
-    F --> G[Lua callback]
-    G --> H[verdict returned]
-```
+eBPF = structure + safe hooks
+
+Lua  = dynamic policy engine
 
 Currently, `luaxdp` implements this pattern but it is **tightly coupled to XDP**. 
 The kfunc `bpf_luaxdp_run()` is registered only for `BPF_PROG_TYPE_XDP` and 
