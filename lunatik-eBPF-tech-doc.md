@@ -1,16 +1,23 @@
 # Lunatik eBPF Abstraction Layer
 
-I chose this project because it sits at the intersection of two things I find
-genuinely interesting:
-- eBPF
-- Lua
+Lunatik has support for [XDP](https://en.wikipedia.org/wiki/Express_Data_Path) through its
+[xdp](https://luainkernel.github.io/lunatik/modules/xdp.html) module
 
-After studying the Lunatik codebase and the existing `luaxdp` binding, I spent
-time surveying the Linux Traffic Control subsystem, eBPF program types, and the
-limitations of the BPF verifier to understand what the right problem to solve
-actually was. That process led me to a conclusion: **the value of new bindings is 
-combinatory, not linear**. Each binding added to Lunatik multiplies
-the scripting surface available. `luatc` alone is not the point. 
+After studying the Lunatik codebase and the existing [luaxdp](https://github.com/luainkernel/lunatik/blob/master/lib/luaxdp.c)
+binding, I spent time surveying the Linux Traffic Control subsystem, eBPF program 
+types, and the limitations of the BPF verifier to understand what the right problem to solve
+actually was.
+
+LuaXDP uses eBPF as a layer to integrate Lua callbacks ([reference here](https://victornogueirario.github.io/xdplua/)).
+TC would use something like that only. The reason being: XDP does not allow
+Linux kernel modules to be called directly. At present it is only extensible through
+eBPF. So an eBPF layer is essential for now.
+
+Same story goes for TC.
+
+That process led me to a conclusion: **the value of new bindings is combinatory,
+not linear**. Each binding added to Lunatik multiplies the scripting surface 
+available. `luatc` alone is not the point.
 
 A generic, reusable `bpf_lunatik_run()` layer that makes every future binding
 easier will be a better value addition to Lunatik ecosystem.
