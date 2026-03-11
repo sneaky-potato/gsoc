@@ -25,5 +25,5 @@ as a potential project. I would like to apply for the same.
 I am writing a technical document [lunatik-eBPF-tech-doc.md](./lunatik-eBPF-tech-doc.md)
 outlining the need for eBPF abstraction layer in Lunatik.
 
-My proposal for the same is [here](./lablua-apply.md)
+I will be documenting my proposal [here](./lablua-apply.md), work in progress right now.
 

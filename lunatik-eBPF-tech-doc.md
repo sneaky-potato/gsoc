@@ -4,7 +4,8 @@ Lunatik has support for [XDP](https://en.wikipedia.org/wiki/Express_Data_Path) t
 [xdp](https://luainkernel.github.io/lunatik/modules/xdp.html) module
 
 After studying the Lunatik codebase and the existing [luaxdp](https://github.com/luainkernel/lunatik/blob/master/lib/luaxdp.c)
-binding, I spent time surveying the Linux Traffic Control subsystem, eBPF program 
+binding, I spent time surveying the Linux Traffic Control subsystem
+([here](https://gist.github.com/sneaky-potato/72e6fffca5b035f60a4ca391922e1224)), eBPF program 
 types, and the limitations of the BPF verifier to understand what the right problem to solve
 actually was.
 
@@ -13,7 +14,8 @@ TC would use something like that only. The reason being: XDP does not allow
 Linux kernel modules to be called directly. At present it is only extensible through
 eBPF. So an eBPF layer is essential for now.
 
-Same story goes for TC.
+Same story goes for TC. Since an eBPF layer cannot be eliminated completely and 
+a lot of code from luaxdp would be used in this binding as well.
 
 That process led me to a conclusion: **the value of new bindings is combinatory,
 not linear**. Each binding added to Lunatik multiplies the scripting surface 
@@ -51,14 +53,14 @@ we can make them complementary tools for different parts of the same problem.
 The design philosophy of this project follows the pattern established by `luaxdp`:
 
 ```mermaid
-flowchart LR
+flowchart TD
 
     NIC[NIC / Packet Source]
 
     subgraph eBPF Layer
         TC[TC Hook]
         BPF[eBPF Program]
-        KFUNC[bpf_lunatik_run kfunc]
+        KFUNC[bpf_luaxdp_run kfunc]
     end
 
     subgraph Lunatik Layer
@@ -80,7 +82,7 @@ flowchart LR
 
 - **eBPF programs define the points of interest**: fast-path, packet parsing,
   the conditions under which policy logic is needed.
-- **`bpf_lunatik_run()` is the weaving point**: execution suspends, control
+- **`bpf_luaxdp_run()` is the weaving point**: execution suspends, control
   passes to Lua, a verdict is returned, execution resumes.
 - **Lua scripts define the policy**: string matching, pattern tables, dynamic
   rules, hot-reloadable without recompiling or reloading any BPF program.
@@ -97,7 +99,7 @@ This project aims to generalize that design.
 
 ---
 
-### Component 1: Generic `bpf_lunatik_run()` Layer
+### Component 1: Generic `lunatik_bpf_run()` Layer
 
 The eBPF docs mention a list of kfuncs [here](https://docs.ebpf.io/linux/kfuncs/),
 This could provide with inspiration for future kfunc support by Lunatik.
@@ -152,21 +154,6 @@ None of these are available at XDP. TC is where shaping decisions are made.
 Lua is where complex policy logic: string matching, pattern tables,
 dynamic rules, is expressed. The two are complementary.
 
-#### `luatc_data` Userdata
-
-The `__sk_buff` is exposed to Lua as a `luatc_data` userdata:
-
-```lua
-pkt[i]           -- raw byte at offset i (skb->data)
-pkt:len()        -- skb->len
-pkt.mark         -- skb->mark           (r/w)
-pkt.priority     -- skb->priority       (r/w)
-pkt.tc_index     -- skb->tc_index       (r/w)
-pkt.tc_classid   -- skb->tc_classid     (r/w)
-pkt.protocol     -- skb->protocol       (r)
-pkt.tstamp       -- skb->tstamp         (r/w)
-```
-
 #### `tc` Lua Module
 
 ```lua
@@ -183,9 +170,144 @@ tc.attach(handler)    -- register Lua callback
 tc.detach()           -- unregister
 ```
 
+#### Helper methods to read qdiscs, class_stats
+
+While thinking about `bpf_lunatik_run` I started wondering whether it would
+be a good idea to add bindings to control `tc` via Lua. The `tc` CLI is just a
+netlink client. From a kernel module you cannot call netlink from the inside
+the same way, those paths are designed for userspace-to-kernel communication.
+
+StackOverflow discussion on the same [here](https://stackoverflow.com/questions/3123936/how-to-manage-qdisc-from-kernel)
+
+What you can do from a kernel module is call the internal functions directly:
+`qdisc_create()`, [`tc_modify_qdisc`](https://elixir.bootlin.com/linux/v6.19.6/source/net/sched/sch_api.c#L1795),
+[`qdisc_graft()`](https://elixir.bootlin.com/linux/v6.19.6/source/net/sched/sch_api.c#L1087).
+But these are not stable exported APIs, they are internal to `net/sched/`.
+
+So a natural extension to Lua could be helper methods to read the qdiscs
+and class stats.
+
+```lua
+local tc = require("tc")
+
+local q = tc.qdisc_get("eth0")   -- read existing qdisc
+local stats = q:class_stats("1:10")  -- bytes, packets, drops per class
+if stats.backlog > threshold then
+    -- adjust classification dynamically via tc_classid on packets
+end
+```
+
+[`Qdisc_class_ops`](https://elixir.bootlin.com/linux/v6.19.6/source/include/net/sch_generic.h#L263)
+will be handy in this prospect.
+
 ---
 
-### Component 3: Examples using tc and Lua
+### Component 3: eBPF Maps Module
+
+To fully use the bpf ecosystem via Lunatik, another value addition would be
+an **eBPF maps module for Lunatik**. This will allow Lunatik to have:
+
+- **Stateful policies**: a Lua DNS handler writes `{ip -> classid}` to a map;
+  the eBPF fast path reads it
+- **Cross-binding composition**: `luaxdp` writes to a map that `luatc` reads,
+  enabling pipelines that span subsystems
+- **Operator visibility**: Lua scripts read kernel maps to inspect state without
+  a separate userspace tool
+
+```lua
+local map = require("ebpf.map")
+
+local m = map.open_by_id(42)
+
+local classid = m:lookup(dst_ip)
+
+-- Update (flags: maps.ANY | maps.NOEXIST | maps.EXIST)
+m:update(dst_ip, new_classid)
+
+m:delete(stale_ip)
+
+-- Iterate (hash maps only)
+local next_key = m:next(current_key_buf)  -- nil when exhausted
+
+-- or just let GC handle it via __gc -> bpf_map_put
+m:close()
+```
+
+#### Technical homework
+
+eBPF maps are created via `bpf(BPF_MAP_CREATE, ...)` and accessed via
+`bpf_map_lookup_elem`, `bpf_map_update_elem`, and `bpf_map_delete_elem` helpers.
+We want to access these via kernel's internal map API without going through syscall
+interface.
+
+The following APIs are exposed by kernel to use:
+- All userspace calls (through libbpf) go through [`SYSCALL_DEFINE3()`](https://elixir.bootlin.com/linux/v6.19.2/source/kernel/bpf/syscall.c#L6272)
+- [`bpf_map_get(u32 ufd)`](https://elixir.bootlin.com/linux/v6.19.2/source/include/linux/bpf.h#L2487)
+- [`bpf_map_get_with_uref(u32 ufd)`](https://elixir.bootlin.com/linux/v6.19.2/source/include/linux/bpf.h#L2488)
+- [`bpf_map_get_curr_or_next(u32 *id)`](https://elixir.bootlin.com/linux/v6.19.2/source/include/linux/bpf.h#L2536)
+
+`bpf_map_get` will need the file descriptor which needs to be created via
+a userspace process context. However `bpf_lunatik_run` is going to run on softirq
+context. So we could utilize `bpf_map_get_curr_or_next` API.
+
+This will require the map id to be passed.
+
+### Minimal API
+
+```c
+static const luaL_Reg luamap_methods[] = {
+    {"lookup",  luamap_lookup},
+    {"update",  luamap_update},
+    {"delete",  luamap_delete},
+    {"close",   luamap_close},
+    {NULL, NULL}
+};
+
+static int luamap_init(lua_State *L) {
+    luaL_newmetatable(L, LUAMAP_MT);
+
+    lua_pushvalue(L, -1);
+    lua_setfield(L, -2, "__index");
+
+    lua_pushcfunction(L, luamap_close);
+    lua_setfield(L, -2, "__gc");
+
+    luaL_setfuncs(L, luamap_methods, 0);
+    return 0;
+}
+
+static int luamap_open_by_id(lua_State *L) {
+    u32 id = (u32)luaL_checkinteger(L, 1);
+
+    struct bpf_map *map = bpf_map_get_curr_or_next(&id);
+    if (!map)
+        return luaL_error(L, "map id %u not found", id);
+
+    // allocate userdata to hold struct bpf_map *
+    luamap_data *m = lua_newuserdata(L, sizeof(luamap_data));
+    m->map = map;
+
+    // tag it with our metatable
+    luaL_setmetatable(L, LUAMAP_MT);
+    return 1;  // returns the userdata to Lua
+}
+
+static int luamap_lookup(lua_State *L) {
+    luamap_data *m = luaL_checkudata(L, 1, LUAMAP_MT);
+    ...
+}
+
+static int luamap_close(lua_State *L) {
+    luamap_data *m = luaL_checkudata(L, 1, LUAMAP_MT);
+    if (m->map) {
+        bpf_map_put(m->map);  // decrement refcount
+        m->map = NULL;
+    }
+    return 0;
+}
+```
+
+### Examples using tc and Lua
 
 1. Multi field egress classification
 
@@ -401,107 +523,7 @@ investment.
 
 ---
 
-## eBPF Maps Module
-
-To fully use the bpf ecosystem via Lunatik, another value addition would be
-an **eBPF maps module for Lunatik**. This will allow Lunatik to have:
-
-- **Stateful policies**: a Lua DNS handler writes `{ip -> classid}` to a map;
-  the eBPF fast path reads it
-- **Cross-binding composition**: `luaxdp` writes to a map that `luatc` reads,
-  enabling pipelines that span subsystems
-- **Operator visibility**: Lua scripts read kernel maps to inspect state without
-  a separate userspace tool
-
-```lua
-local map = require("ebpf.map")
-
-local flow_table = map.open("ip_class_map")
-local classid = flow_table:lookup(dst_ip)
-flow_table:update(src_ip, new_classid)
-flow_table:delete(stale_ip)
-```
-
----
-
-### Technical homework
-
-eBPF maps are created via `bpf(BPF_MAP_CREATE, ...)` and accessed via
-`bpf_map_lookup_elem`, `bpf_map_update_elem`, and `bpf_map_delete_elem` helpers.
-We want to access these via kernel's internal map API without going through syscall
-interface.
-
-The following APIs are exposed by kernel to use:
-- All userspace calls (through libbpf) go through [`SYSCALL_DEFINE3()`](https://elixir.bootlin.com/linux/v6.19.2/source/kernel/bpf/syscall.c#L6272)
-- [`bpf_map_get(u32 ufd)`](https://elixir.bootlin.com/linux/v6.19.2/source/include/linux/bpf.h#L2487)
-- [`bpf_map_get_with_uref(u32 ufd)`](https://elixir.bootlin.com/linux/v6.19.2/source/include/linux/bpf.h#L2488)
-- [`bpf_map_get_curr_or_next(u32 *id)`](https://elixir.bootlin.com/linux/v6.19.2/source/include/linux/bpf.h#L2536)
-
-`bpf_map_get` will need the file descriptor which needs to be created via
-a userspace process context. However `bpf_lunatik_run` is going to run on softirq
-context. So we could utilize `bpf_map_get_curr_or_next` API.
-
-This will require the map id to be passed.
-
-### Minimal API
-
-```c
-static const luaL_Reg luamap_methods[] = {
-    {"lookup",  luamap_lookup},
-    {"update",  luamap_update},
-    {"delete",  luamap_delete},
-    {"close",   luamap_close},
-    {NULL, NULL}
-};
-
-static int luamap_init(lua_State *L) {
-    luaL_newmetatable(L, LUAMAP_MT);
-
-    lua_pushvalue(L, -1);
-    lua_setfield(L, -2, "__index");
-
-    lua_pushcfunction(L, luamap_close);
-    lua_setfield(L, -2, "__gc");
-
-    luaL_setfuncs(L, luamap_methods, 0);
-    return 0;
-}
-
-static int luamap_open_by_id(lua_State *L) {
-    u32 id = (u32)luaL_checkinteger(L, 1);
-
-    struct bpf_map *map = bpf_map_get_curr_or_next(&id);
-    if (!map)
-        return luaL_error(L, "map id %u not found", id);
-
-    // allocate userdata to hold struct bpf_map *
-    luamap_data *m = lua_newuserdata(L, sizeof(luamap_data));
-    m->map = map;
-
-    // tag it with our metatable
-    luaL_setmetatable(L, LUAMAP_MT);
-    return 1;  // returns the userdata to Lua
-}
-
-static int luamap_lookup(lua_State *L) {
-    // this errors if user passes wrong type — type safety
-    luamap_data *m = luaL_checkudata(L, 1, LUAMAP_MT);
-    ...
-}
-
-static int luamap_close(lua_State *L) {
-    luamap_data *m = luaL_checkudata(L, 1, LUAMAP_MT);
-    if (m->map) {
-        bpf_map_put(m->map);  // decrement refcount
-        m->map = NULL;
-    }
-    return 0;
-}
-```
-
----
-
-## Why This Project, In One Paragraph
+## Why This Project?
 
 Linux is going all the way with eBPF. That is a fact. But eBPF optimises for
 verifiability and performance, not expressiveness. The BPF verifier is a

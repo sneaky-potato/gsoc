@@ -1,4 +1,8 @@
-Application Template
+# Proposal
+
+> [!WARNING] 
+> WORK IN PROGRESS
+
 BASICS
 What is your preferred e-mail address?
 Do you have a website / blog / github?
