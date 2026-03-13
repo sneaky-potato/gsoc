@@ -37,53 +37,102 @@
   columns: (35%, 65%),
   [*Preferred Email*], [ashwanikamal.im421\@gmail.com],
   [*GitHub*], [https://github.com/sneaky-potato/],
-  [*Academic Background*], [Bachelor of Technology in Computer Science and Engineering, IIT Kharagpur],
+  [*Matrix ID*], [\@sneaky-potato:matrix.org],
+  [*Academic Background*], [I graduated from IIT Kharagpur in 2024, with
+  Bachelor of Technology in Computer Science and Engineering],
   [*Time Commitments During GSoC*], [no time],
 )
 
 = Experience
 
-== Programming Languages & Tools
+== Programming Languages
 
-I primarily work with systems programming languages including C, Go, and
-Lua. My development workflow uses Git, Linux-based environments,
-and the neovim editor. I also use some kernel tooling such as libbpf utilities,
-bpftool.
+I primarily work with systems programming languages including C, C++, Go, and
+Lua. I also use Bash for scripting.
+
+
+== Tools for development
+
+My development workflow uses Git, Linux-based environments,
+and the Neovim editor. I also use some debugging tooling such as GDB, strace,
+ltrace, libbpf utilities, bpftool.
 
 == Lua Experience
 
-I got introduced to Lua via Neovim
+I got introduced to Lua via Neovim configuration and basic scripting.
+I contributed to Lunatik through which I got the major experience of
+Lua and Lua C API. It helped me understand how Lua fits as an
+embeddable language.
 
-Lua is designed as an embeddable scripting language and is commonly used as a
-policy layer in host systems. My work with Lunatik involves studying how Lua
-integrates with kernel components to allow safe scripting inside the kernel.
+== Software Development Experience
 
-I have explored the Lunatik codebase, especially the
-`luaxdp` binding that integrates Lua with XDP programs.
+I work as a Software Engineer at *Schlumberger* where I build backend
+services and internal tools used in production systems. My work involves
+designing microservices, optimizing database access patterns, and
+improving the reliability and performance of distributed systems.
 
-== Team Development Experience
+Recently, I led the migration of over 1 million customer records to
+separate sensitive personally identifiable information (PII) from
+operational data, improving data isolation and security. I also optimized
+identity lookup queries using improved SQL joins and Redis caching,
+reducing P95 request latency by approximately 40%.
 
-I have experience collaborating through Git workflows including pull requests,
-code reviews, and issue-driven development. I am comfortable discussing design
-decisions, iterating on feedback, and maintaining documentation alongside code.
+I regularly collaborate with other engineers using Git-based workflows
+including pull requests, code reviews, and issue-driven development.
+I am comfortable discussing trade-offs, iterating on reviews, and
+maintaining documentation alongside code.
+
+Prior to this role, I completed a software engineering internship at
+*Piramal Retail Finance* where I built a prototype in house job
+scheduler capable of handling more than 10,000 scheduled tasks per day
+across multiple microservices.
 
 == Previous Projects
 
-Some relevant technical projects include:
+Some technical projects I have built include:
+
+- *Goof Programming Language* (Hobby project):
+
+As an attempt to understand language runtimes, I wrote a compiler for my
+a programming language Goof which is a stack-based, concatenative 
+language inspired by Forth for x86\_64 architectures. I have to bootstrap
+the compiler yet.
+
+The compiler, emits x86\_64 assembly and produces statically linked ELF 
+binaries for Linux. The project includes a lexer, parser, stack-based 
+intermediate representation, type checking, and a runtime supporting 
+control flow, recursion, and system calls.
+
+- *Route Optimization Backend (Inter IIT Tech Meet)* (Competition): 
+Developed backend services for a delivery route planning system used during 
+the Inter IIT Tech Meet competition. The system exposed HTTP and gRPC APIs, used
+RabbitMQ for asynchronous task processing, and was containerized with
+Docker to enable reliable deployment.
+
+These projects helped me develop strong experience working with
+systems-level programming, distributed systems, and backend service
+design.
 
 == Open Source Contributions
 
-I have been exploring and contributing to the Lunatik ecosystem,
-studying the implementation of its existing modules and identifying
-areas where the architecture can be generalized.
+I have been actively exploring and contributing to the Lunatik ecosystem,
+which enables Lua scripting within the Linux kernel.
 
-This proposal is based on that investigation and aims to extend Lunatik's
-capabilities in a reusable way.
+While studying the existing implementation of Lunatik modules, I worked
+on improving the method dispatch mechanism used by Lua objects in the
+kernel runtime. By replacing repeated table lookups with eager closure
+wrapping, I reduced method call overhead from roughly 275ns to 128ns in
+benchmark tests across one million iterations.
+
+In addition to Lunatik, I have also contributed patches to the etcd
+project, focusing on improving the correctness and determinism of the
+robustness testing framework by removing redundant delete and compact
+operations.
 
 = GSoC
 
 #table(
-  columns: (45%, 55%),
+  columns: (50%, 50%),
   stroke: none,
   [*Participated in GSoC before?*], [No],
   [*Applied but not selected before?*], [No],
@@ -92,11 +141,21 @@ capabilities in a reusable way.
 
 = Project
 
+I have selected the project *Lunatik Binding for Linux Traffic Control (TC) and
+eBPF Maps* which is from the idea list.
+
+I chose it because it involves Linux subsystems and eBPF. While working on
+Lunatik I always compared scenarios with eBPF because it exists to serve
+a similar purpose for kernel: *scripting*.
+
+Through this project I want to justify the use of Lua through Lunatik, even
+though eBPF exists for the kernel.
+
 == Selected Idea
 
 This project builds on Lunatik's existing networking capabilities,
-specifically the `luaxdp` module, and proposes a **generalized eBPF
-integration layer**.
+specifically the `luaxdp` module, and proposes a *generalized eBPF
+integration layer*.
 
 The motivation comes from studying Lunatik's current architecture and
 realizing that the value of new bindings is *combinatory rather than
@@ -113,16 +172,12 @@ future bindings can use.
 
 eBPF has become the dominant mechanism for extending the Linux kernel at
 runtime. It is fast, safe, and verifier-enforced. However, the verifier
-also limits expressiveness.
-
-Complex logic such as:
+also limits expressiveness and complex logic such as:
 
 - dynamic string matching
 - pattern-based rules
 - dynamic policy tables
 - hot-swappable logic
-
-cannot easily be expressed within the constraints of eBPF programs.
 
 Lua solves exactly this problem. It is small, embeddable, and designed
 to act as a scripting layer that extends a host system without replacing
@@ -133,7 +188,7 @@ its core architecture.
 This project follows a simple design pattern:
 
 - *eBPF defines structure and safe hooks*
-- **Lua implements dynamic policy logic**
+- *Lua implements dynamic policy logic*
 
 The idea is to allow eBPF programs to delegate complex decisions to
 Lua handlers inside Lunatik.
