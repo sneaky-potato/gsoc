@@ -37,7 +37,7 @@
   columns: (35%, 65%),
   [*Preferred Email*], [ashwanikamal.im421\@gmail.com],
   [*GitHub*], [https://github.com/sneaky-potato/],
-  [*Academic Background*], [B.Tech Computer Science and Engineering, IIT Kharagpur],
+  [*Academic Background*], [Bachelor of Technology in Computer Science and Engineering, IIT Kharagpur],
   [*Time Commitments During GSoC*], [no time],
 )
 
@@ -45,12 +45,14 @@
 
 == Programming Languages & Tools
 
-I primarily work with systems programming languages including C, Lua, and
-Go. My development workflow uses Git, Linux-based environments,
+I primarily work with systems programming languages including C, Go, and
+Lua. My development workflow uses Git, Linux-based environments,
 and the neovim editor. I also use some kernel tooling such as libbpf utilities,
 bpftool.
 
 == Lua Experience
+
+I got introduced to Lua via Neovim
 
 Lua is designed as an embeddable scripting language and is commonly used as a
 policy layer in host systems. My work with Lunatik involves studying how Lua
@@ -130,7 +132,7 @@ its core architecture.
 
 This project follows a simple design pattern:
 
-- **eBPF defines structure and safe hooks**
+- *eBPF defines structure and safe hooks*
 - **Lua implements dynamic policy logic**
 
 The idea is to allow eBPF programs to delegate complex decisions to
