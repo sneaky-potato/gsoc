@@ -523,6 +523,69 @@ investment.
 
 ---
 
+<<<<<<< HEAD
+=======
+## eBPF Maps Module
+
+To fully use the bpf ecosystem via Lunatik, another value addition would be
+an **eBPF maps module for Lunatik**. This will allow Lunatik to have:
+
+- **Stateful policies**: a Lua DNS handler writes `{ip -> classid}` to a map;
+  the eBPF fast path reads it
+- **Cross-binding composition**: `luaxdp` writes to a map that `luatc` reads,
+  enabling pipelines that span subsystems
+- **Operator visibility**: Lua scripts read kernel maps to inspect state without
+  a separate userspace tool
+
+```lua
+local map = require("ebpf.map")
+
+local flow_table = map.open_by_id(42) -- must be known from bpf userspace tools
+local classid = flow_table:lookup(dst_ip)
+flow_table:update(src_ip, new_classid)
+flow_table:delete(stale_ip)
+```
+
+---
+
+### Technical homework
+
+eBPF maps are created via `bpf(BPF_MAP_CREATE, ...)` and accessed via
+`bpf_map_lookup_elem`, `bpf_map_update_elem`, and `bpf_map_delete_elem` helpers.
+We want to access these via kernel's internal map API without going through syscall
+interface.
+
+The following APIs are exposed by kernel to use:
+- All userspace calls (through libbpf) go through [`SYSCALL_DEFINE3()`](https://elixir.bootlin.com/linux/v6.19.2/source/kernel/bpf/syscall.c#L6272)
+- [`bpf_map_get(u32 ufd)`](https://elixir.bootlin.com/linux/v6.19.2/source/include/linux/bpf.h#L2487)
+- [`bpf_map_get_with_uref(u32 ufd)`](https://elixir.bootlin.com/linux/v6.19.2/source/include/linux/bpf.h#L2488)
+- [`bpf_map_get_curr_or_next(u32 *id)`](https://elixir.bootlin.com/linux/v6.19.2/source/include/linux/bpf.h#L2536)
+
+`bpf_map_get` will need the file descriptor which needs to be created via
+a userspace process context. However `bpf_lunatik_run` is going to run on softirq
+context. So we could utilize `bpf_map_get_curr_or_next` API.
+
+This will require the map id to be passed.
+
+### eBPF Map Lifecycle
+
+1. Creation
+This design requires bpf maps to be created outside Lunatik, via userspace 
+programs like `bpftool`. We can get the map ID once it is created.
+
+2. Lookup and usage
+The map ID can be used to lookup the pointer to map in the kernel.
+- `open_by_id()` will return the map pointer and increase the reference counter of the map.
+- `lookup(key)` on the map pointer will return the value stored in the map for the provided key. We can reuse `luadata` for the actual types.
+- `update(key, data)` on the map pointer will update the map for the provided key with the given data.
+- `delete(key)` on the map pointer will delete the key from the map.
+- Once we have the pointer to `struct bpf_map`, we could call kernel ops helpers defined [here](https://elixir.bootlin.com/linux/v6.19.2/source/include/linux/bpf.h#L106) to do lookup, update, delete.
+
+3. Cleanup
+- `close()` will cleanup the map from Lua, and decrease the reference counter via [`bpf_map_put(struct bpf_map *map)`](https://elixir.bootlin.com/linux/v6.19.2/source/include/linux/bpf.h#L2521)
+
+---
+
 ## Why This Project?
 
 Linux is going all the way with eBPF. That is a fact. But eBPF optimises for
