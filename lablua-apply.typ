@@ -487,7 +487,20 @@ This will require the map id to be passed.
 
 ==== eBPF Map Lifecycle
 
-WORK IN PROGRESS
+1. Creation
+This design requires bpf maps to be created outside Lunatik, via userspace 
+programs like `bpftool`. We can get the map ID once it is created.
+
+2. Lookup and usage
+The map ID can be used to lookup the pointer to map in the kernel.
+- `open_by_id()` will return the map pointer and increase the reference counter of the map.
+- `lookup(key)` on the map pointer will return the value stored in the map for the provided key. We can reuse `luadata` for the actual types.
+- `update(key, data)` on the map pointer will update the map for the provided key with the given data.
+- `delete(key)` on the map pointer will delete the key from the map.
+- Once we have the pointer to `struct bpf_map`, we could call kernel ops helpers defined #link("https://elixir.bootlin.com/linux/v6.19.2/source/include/linux/bpf.h#L106")[here] to do lookup, update, delete.
+
+3. Cleanup
+- `close()` will cleanup the map from Lua, and decrease the reference counter via #link("https://elixir.bootlin.com/linux/v6.19.2/source/include/linux/bpf.h#L2521")[`bpf_map_put(struct bpf_map *map)`]
 
 #diagram(
   node-stroke: 1pt,
