@@ -1,14 +1,9 @@
 #import "@preview/fletcher:0.5.8" as fletcher: diagram, node, edge
 
-#let teal   = rgb("#0D9488")
 #let teal-d = rgb("#0F766E")
-#let teal-l = rgb("#CCFBF1")
 #let ink    = rgb("#0F172A")
-#let muted  = rgb("#64748B")
 #let white  = rgb("#FFFFFF")
 #let light  = rgb("#F8FAFC")
-#let gray-l = rgb("#F1F5F9")
-#let gray-d = rgb("#475569")
 
 #set page(margin: 2.5cm)
 
@@ -42,6 +37,9 @@
   #text(size: 18pt)[LabLua]
 
   #text(size: 18pt)[Lunatik eBPF Abstraction Layer]
+  #v(0.1cm)
+
+  #text(size: 16pt)[Binding for Linux Traffic Control (TC) and eBPF Maps]
 
   #v(0.8cm)
 
@@ -73,9 +71,8 @@
 
 == Programming Languages
 
-I primarily work with systems programming languages including C, C++, Go, and
+I primarily work with languages including C, C++, Go, and
 Lua. I also use Bash for scripting.
-
 
 == Tools for development
 
@@ -169,9 +166,12 @@ operations.
 I have selected the project *Lunatik Binding for Linux Traffic Control (TC) and
 eBPF Maps* which is from the idea list.
 
-I chose it because it involves Linux subsystems and eBPF. While working on
-Lunatik I always compared scenarios with eBPF because it exists to serve
-a similar purpose for kernel: *scripting*.
+While working on Lunatik I always compared scenarios with eBPF because it
+exists to serve a similar purpose for kernel: *scripting*.
+
+I noticed while contributing to Lunatik that to run Lua callbacks from bpf programs
+there was one hook `bpf_luaxdp_run` but it was tightly coupled to xdp
+and that the abstraction layer was missing.
 
 While doing the technical reading required for this project I realized how Lua
 could be used as a high level abstraction to further increase the expressiveness
@@ -234,7 +234,7 @@ The architecture looks like this:
   edge("-|>"),
   node((1,2), [eBPF Program]),
   edge("-|>"),
-  node((1,3), [Call `bpf_lunatik_run()` kfunc]),
+  node((1,3), [Call `lunatik_bpf_run()` kfunc]),
   edge("-|>"),
   node((1,4), [Lunatik Runtime]),
   edge("-|>"),
@@ -262,7 +262,7 @@ This project aims to generalize that design.
 
 == Core Components
 
-=== Generic `bpf_lunatik_run()` Layer
+=== Generic `lunatik_bpf_run()` Layer
 
 Since eBPF programs cannot call arbitrary kernel functions, the Linux kernel
 provides kfuncs as a mechanism for exposing functionality to BPF programs. 
@@ -375,84 +375,13 @@ tc.attach(handler)    -- register Lua callback
 tc.detach()           -- unregister
 ```
 
-Example Lua handler: *Multi field egress classification*
-
-TC filters classify packets into HTB classes, but existing classifiers (u32, flower) 
-can only match static L3/L4 fields. They cannot combine multiple fields with 
-conditional logic. Operators are forced into this pattern:
-
-```shell
-iptables -t mangle -A POSTROUTING -p tcp --dport 443 -j MARK --set-mark 0x1
-iptables -t mangle -A POSTROUTING -p udp --dport 53  -j MARK --set-mark 0x1
-tc filter add dev eth0 parent 1:0 handle 0x1 fw classid 1:10
-```
-
-Problems with this:
-- Requires iptables and tc: two subsystems to configure
-- Port-based only, cannot combine complex logic of ANDs and ORs of port + protocol + packet size + DSCP
-- Static, adding a new rule requires editing iptables and reloading
-- IPv6 variable headers break u32 offset-based matching
-
-This can be conveniently solved via a Lua policy handler.
-```lua
--- qos.lua
-local tc = require("tc")
-
-local policy = {
-    -- realtime: VoIP and gaming
-    {
-        match = function(p)
-            return p.protocol == 0x0800          -- IPv4
-               and p:ip_proto() == 17            -- UDP
-               and p.len < 256                   -- small packet
-               and (p:dscp() == 46               -- DSCP Expedited Forwarding
-                    or p.priority >= 6)          -- SO_PRIORITY high
-        end,
-        classid = 0x00010010   -- 1:10 realtime
-    },
-
-    -- bulk: large TCP segments, likely file transfer or backup
-    {
-        match = function(p)
-            return p.protocol == 0x0800
-               and p:ip_proto() == 6             -- TCP
-               and p.len > 1400                  -- near-MTU = bulk transfer
-               and p.priority == 0               -- no special priority set
-        end,
-        classid = 0x00010030   -- 1:30 bulk
-    },
-
-    -- interactive: SSH, DNS
-    {
-        match = function(p)
-            local dport = p:dst_port()
-            return dport == 22                   -- SSH
-                or dport == 53                   -- DNS
-                or dport == 123                  -- NTP
-        end,
-        classid = 0x00010010   -- 1:10 realtime
-    },
-}
-
-local function handler(pkt)
-    for _, rule in ipairs(policy) do
-        if rule.match(pkt) then
-            pkt.tc_classid = rule.classid
-            return tc.action.OK
-        end
-    end
-    return tc.action.OK
-end
-
-tc.attach(handler)
-```
-
 === eBPF Maps Module
 
-To fully use the bpf ecosystem via Lunatik, another value addition would be
-an *eBPF maps module for Lunatik*. This will allow Lunatik to have:
+To fully use the bpf ecosystem via Lunatik, we need access to shared kernel
+state. Hence support for *eBPF maps module for Lunatik* is important,
+this will allow Lunatik to have:
 
-- *Stateful policies*: a Lua DNS handler writes `{ip -> classid}` to a map;
+- *Stateful policies*: a Lua handler writes `{ip -> classid}` to a map;
   the eBPF fast path reads it
 - *Cross-binding composition*: `luaxdp` writes to a map that `luatc` reads,
   enabling pipelines that span subsystems
@@ -480,26 +409,24 @@ The following APIs are exposed by kernel to use:
 - #link("https://elixir.bootlin.com/linux/v6.19.2/source/include/linux/bpf.h#L2536")[`bpf_map_get_curr_or_next(u32 *id)`]
 
 `bpf_map_get` will need the file descriptor which needs to be created via
-a userspace process context. However `bpf_lunatik_run` is going to run on softirq
+a userspace process context. However `lunatik_bpf_run` is going to run on softirq
 context. So we could utilize `bpf_map_get_curr_or_next` API.
 
 This will require the map id to be passed.
 
-==== eBPF Map Lifecycle
-
-1. Creation
+==== Map Creation
 This design requires bpf maps to be created outside Lunatik, via userspace 
 programs like `bpftool`. We can get the map ID once it is created.
 
-2. Lookup and usage
+==== Map Lookup and usage
 The map ID can be used to lookup the pointer to map in the kernel.
-- `open_by_id()` will return the map pointer and increase the reference counter of the map.
+- `open_by_id()` will return the map pointer and increase the reference counter of the map via #link("https://elixir.bootlin.com/linux/v6.19.8/source/kernel/bpf/syscall.c#L1623")[`bpf_map_inc(struct bpf_map *map)`].
 - `lookup(key)` on the map pointer will return the value stored in the map for the provided key. We can reuse `luadata` for the actual types.
 - `update(key, data)` on the map pointer will update the map for the provided key with the given data.
 - `delete(key)` on the map pointer will delete the key from the map.
 - Once we have the pointer to `struct bpf_map`, we could call kernel ops helpers defined #link("https://elixir.bootlin.com/linux/v6.19.2/source/include/linux/bpf.h#L106")[here] to do lookup, update, delete.
 
-3. Cleanup
+==== Cleanup
 - `close()` will cleanup the map from Lua, and decrease the reference counter via #link("https://elixir.bootlin.com/linux/v6.19.2/source/include/linux/bpf.h#L2521")[`bpf_map_put(struct bpf_map *map)`]
 
 #diagram(
@@ -531,12 +458,92 @@ The map ID can be used to lookup the pointer to map in the kernel.
   edge((2,3), (1,4), "-|>", label: [lookup], label-side: left),
 )
 
+=== First Packet Classification
+
+1. Setup TC
+```shell
+tc qdisc del dev eth0 root 2>/dev/null
+tc qdisc add dev eth0 root handle 1: htb default 30
+
+tc class add dev eth0 parent 1: classid 1:10 htb rate 20mbit  # realtime
+tc class add dev eth0 parent 1: classid 1:20 htb rate 10mbit  # streaming
+tc class add dev eth0 parent 1: classid 1:30 htb rate 5mbit   # bulk/default
+
+tc filter add dev eth0 ingress bpf da obj tc.bpf.o sec classifier
+```
+
+2. eBPF program
+```c
+extern int bpf_luatc_run(char *key, size_t key__sz, struct __sk_buff *skb, void *arg, size_t arg__sz) __ksym;
+
+SEC("tc")
+int tls_classifier(struct __sk_buff *skb)
+{
+    struct flow_key key = extract_key(skb);
+    // key could be made from src_ip, dst_ip, src_port, dst_port, ip_proto
+    // We could also timestamp the cache entried to handle TCP port reuse.
+
+    __u32 *classid = bpf_map_lookup_elem(&flow_cache, &key);
+    if (classid) {
+        skb->tc_classid = *classid;
+        return TC_ACT_OK;
+    }
+
+    // only invoke Lua if this looks like a TLS ClientHello
+    if (!is_tls_client_hello(skb))
+        return TC_ACT_OK;
+
+    return bpf_luatc_run(runtime, sizeof(runtime), skb, NULL, 0);
+}
+```
+
+3. Lua policy handler
+```lua
+local tc  = require("tc")
+local map = require("ebpf.map")
+
+local cache = map.open_by_id(FLOW_CACHE_ID)
+
+local policy = {
+    ["netflix%.com$"]       = 0x00010030,  -- bulk
+    ["meet%.google%.com$"]  = 0x00010010,  -- realtime
+    ["%.zoom%.us$"]         = 0x00010010,  -- realtime
+    ["%.backup%.internal$"] = 0x00010040,  -- background
+}
+
+local function parse_sni(p)
+    -- get sni from the packet
+end
+
+local function is_tls_hello(p)
+    -- check if the packet is TLS hello
+end
+
+local function handler(p)
+    if not is_tls_hello(p) then return tc.action.OK end
+
+    local sni = parse_sni(p)
+    if not sni then return tc.action.OK end
+
+    for pattern, classid in pairs(policy) do
+        if sni:match(pattern) then
+            cache:update(p:flow_key(), classid)
+            p.tc_classid = classid
+            return tc.action.OK
+        end
+    end
+
+    return tc.action.OK
+end
+
+tc.attach(handler)
+```
 
 == Expected Results
 
 At the end of this project the Lunatik ecosystem will gain:
 
-- A reusable `bpf_lunatik_run()` abstraction layer
+- A reusable `lunatik_bpf_run()` abstraction layer
 - A new luatc binding for Traffic Control
 - A Lua module for interacting with eBPF maps
 - Documentation and working examples demonstrating the system
@@ -557,17 +564,16 @@ behavior using Lua.
     table.cell(fill: teal-d)[#text(fill: white, weight: "bold")[Milestones]],
   ),
 
-    [Community Bonding], [Study Lunatik internals, discuss architecture with mentors],
-    [Week 1–3], [Implement core `bpf_lunatik_run()` infrastructure and refactor the
+    [Community Bonding], [Agree on the lunatik_bpf_run callback interface with mentors, set up a test VM with BTF-enabled kernel],
+    [Week 1–2], [Implement core `lunatik_bpf_run()` infrastructure and refactor the
     existing `bpf_luaxdp_run()` implementation to use it],
-
-    [Week 4-6],
+    [Week 3-5],
     [Implement `luatc` binding and expose `__sk_buff` context to Lua.],
-    [Week 7-8],
+    [Week 6-9],
     [Implement eBPF maps Lua module and kernel map access wrappers.],
-    [Week 9-10],
-    [Benchmarks of TC eBPF + Lua.],
-    [Week 11-12],
+    [Week 10-11],
+    [Demo scripts and benchmarks of TC eBPF + Lua.],
+    [Week 12],
     [Polish, code cleanup, final evaluation.],
 )
 
@@ -575,7 +581,7 @@ behavior using Lua.
 
 By the midterm evaluation:
 
-- Generic bpf_lunatik_run() layer implemented
+- Generic lunatik_bpf_run() layer implemented
 - bpf_luaxdp_run() refactored to use the new infrastructure
 - Basic luatc binding implemented
 - Lua handlers capable of interacting with TC packet context
@@ -591,16 +597,15 @@ At the end of the project:
 
 = Why This Project
 
-Linux is increasingly adopting eBPF as the standard way to extend the
-kernel safely. However, the BPF verifier limits the expressiveness of
-policy logic.
+I have always been interested in how computers works and how we can
+tweak certain parts to get our job done. I find Lunatik very
+interesting in the sense that it tries to achieve something bold:
+kernel scripting with a high level language.
 
-Lua complements eBPF perfectly: it is lightweight, embeddable, and
-expressive enough to implement the dynamic logic that eBPF cannot.
+Lunatik helped me understand how Lua is actually a glue language
+for already running systems. It is lightweight, embeddable, and
+expressive enough to implement the dynamic logic.
 
-The proposed bpf_lunatik_run() abstraction layer bridges these two
-systems.
-
-Instead of building isolated bindings, this infrastructure allows
+Instead of building isolated bindings, the proposed infrastructure allows
 future Lunatik modules across multiple subsystems to reuse the same
 mechanism, multiplying the scripting capabilities of the kernel.
