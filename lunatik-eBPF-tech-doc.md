@@ -58,7 +58,7 @@ flowchart TD
     NIC[NIC / Packet Source]
 
     subgraph eBPF Layer
-        TC[TC Hook]
+        XDP[XDP Hook]
         BPF[eBPF Program]
         KFUNC[bpf_luaxdp_run kfunc]
     end
@@ -68,8 +68,8 @@ flowchart TD
         LUA[Lua Policy Handler]
     end
 
-    NIC --> TC
-    TC --> BPF
+    NIC --> XDP
+    XDP --> BPF
     BPF --> KFUNC
     KFUNC --> LUNATIK
     LUNATIK --> LUA
@@ -77,7 +77,7 @@ flowchart TD
     LUA -->|verdict| LUNATIK
     LUNATIK -->|return| KFUNC
     KFUNC --> BPF
-    BPF --> TC
+    BPF --> XDP
 ```
 
 - **eBPF programs define the points of interest**: fast-path, packet parsing,
