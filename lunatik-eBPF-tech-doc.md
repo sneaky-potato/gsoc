@@ -21,7 +21,7 @@ That process led me to a conclusion: **the value of new bindings is combinatory,
 not linear**. Each binding added to Lunatik multiplies the scripting surface 
 available. `luatc` alone is not the point.
 
-A generic, reusable `bpf_lunatik_run()` layer that makes every future binding
+A generic, reusable `lunatik_bpf_run()` layer that makes every future binding
 easier will be a better value addition to Lunatik ecosystem.
 
 This paired with an API to interact with eBPF maps will complete this project.
@@ -99,10 +99,45 @@ This project aims to generalize that design.
 
 ---
 
-### Component 1: Generic `lunatik_bpf_run()` Layer
+## Core Components
 
-The eBPF docs mention a list of kfuncs [here](https://docs.ebpf.io/linux/kfuncs/),
+### Generic `lunatik_bpf_run()` Layer
+
+Since eBPF programs cannot call arbitrary kernel functions, the Linux kernel
+provides kfuncs as a mechanism for exposing functionality to BPF programs. 
+These functions are registered with the BPF subsystem using BTF-based kfunc 
+registration, which allows the verifier to enforce safety constraints.
+
+The eBPF docs mention a list of kfuncs here: https://docs.ebpf.io/linux/kfuncs/,
 This could provide with inspiration for future kfunc support by Lunatik.
+
+
+#### Kfunc registration
+
+```c
+__bpf_kfunc int bpf_luaxdp_run(struct xdp_md *ctx, ...);
+__bpf_kfunc int bpf_luatc_run(struct __sk_buff *skb, ...);
+```
+
+The functions are then registered with the BPF subsystem.
+
+```c
+BTF_KFUNCS_START(bpf_luatc_set)
+BTF_ID_FLAGS(func, bpf_luatc_run)
+BTF_KFUNCS_END(bpf_luatc_set)
+```
+
+Finally, during module initialization, the kfunc set is registered with the kernel for the relevant BPF program type:
+```c
+register_btf_kfunc_id_set(
+    BPF_PROG_TYPE_SCHED_CLS,
+    &bpf_luatc_kfunc_set
+);
+```
+
+This restricts them to specific program types such as BPF_PROG_TYPE_SCHED_CLS.
+
+#### Generic interface
 
 Shared internal function that any type-specific kfunc can call:
 
@@ -114,9 +149,9 @@ int lunatik_bpf_run(const char *runtime_name, lunatik_bpf_cb push_ctx, void *ctx
 
 This function:
 1. Looks up the named Lunatik runtime
-3. Calls `push_ctx(L, ctx)` to push the context onto the Lua stack as a typed userdata
-4. Invokes the registered Lua handler
-5. Reads and returns the verdict
+2. Calls `push_ctx(L, ctx)` to push the context onto the Lua stack as a typed userdata
+3. Invokes the registered Lua handler
+4. Reads and returns the verdict
 
 Type-specific kfuncs then become thin wrappers:
 
@@ -134,19 +169,18 @@ __bpf_kfunc int bpf_luatc_run(struct __sk_buff *skb, ...)
 }
 ```
 
+The `runtime` parameter allows multiple Lua runtimes to coexist, enabling different 
+TC classifiers to delegate processing to different Lua handlers.
+
 Each kfunc is registered for its specific `bpf_prog_type` via
 `BTF_KFUNCS_START` / `BTF_KFUNCS_END`, maintaining verifier safety.
 
----
-
-### Component 2: TC Binding (`luatc`)
+=== Traffic Control Binding (luatc)
 
 Traffic Control is the primary demonstration of the generic layer. TC operates
 on `__sk_buff` and is the place in the kernel with several capabilities:
 
 - `tc_classid`: direct assignment to HTB qdisc classes for traffic shaping
-- `struct bpf_sock *sk`: socket identity, enabling `bpf_skb_cgroup_id()` for
-  per-container/per-process policy (TC egress only, unavailable at XDP)
 - `tstamp`: packet transmit timestamp for pacing
 - `priority`, `tc_index`, `mark`: classification metadata
 
@@ -154,7 +188,17 @@ None of these are available at XDP. TC is where shaping decisions are made.
 Lua is where complex policy logic: string matching, pattern tables,
 dynamic rules, is expressed. The two are complementary.
 
-#### `tc` Lua Module
+The `__sk_buff` is exposed to Lua as a `luatc_data` userdata:
+```lua
+pkt[i]           -- raw byte at offset i (skb->data)
+pkt:len()        -- skb->len
+pkt.mark         -- skb->mark           (r/w)
+pkt.priority     -- skb->priority       (r/w)
+pkt.tc_index     -- skb->tc_index       (r/w)
+pkt.tc_classid   -- skb->tc_classid     (r/w)
+pkt.protocol     -- skb->protocol       (r)
+pkt.tstamp       -- skb->tstamp         (r/w)
+```
 
 ```lua
 local tc = require("tc")
@@ -170,70 +214,27 @@ tc.attach(handler)    -- register Lua callback
 tc.detach()           -- unregister
 ```
 
-#### Helper methods to read qdiscs, class_stats
+### eBPF Maps Module
 
-While thinking about `bpf_lunatik_run` I started wondering whether it would
-be a good idea to add bindings to control `tc` via Lua. The `tc` CLI is just a
-netlink client. From a kernel module you cannot call netlink from the inside
-the same way, those paths are designed for userspace-to-kernel communication.
+To fully use the bpf ecosystem via Lunatik, we need access to shared kernel
+state. Hence support for *eBPF maps module for Lunatik* is important,
+this will allow Lunatik to have:
 
-StackOverflow discussion on the same [here](https://stackoverflow.com/questions/3123936/how-to-manage-qdisc-from-kernel)
-
-What you can do from a kernel module is call the internal functions directly:
-`qdisc_create()`, [`tc_modify_qdisc`](https://elixir.bootlin.com/linux/v6.19.6/source/net/sched/sch_api.c#L1795),
-[`qdisc_graft()`](https://elixir.bootlin.com/linux/v6.19.6/source/net/sched/sch_api.c#L1087).
-But these are not stable exported APIs, they are internal to `net/sched/`.
-
-So a natural extension to Lua could be helper methods to read the qdiscs
-and class stats.
-
-```lua
-local tc = require("tc")
-
-local q = tc.qdisc_get("eth0")   -- read existing qdisc
-local stats = q:class_stats("1:10")  -- bytes, packets, drops per class
-if stats.backlog > threshold then
-    -- adjust classification dynamically via tc_classid on packets
-end
-```
-
-[`Qdisc_class_ops`](https://elixir.bootlin.com/linux/v6.19.6/source/include/net/sch_generic.h#L263)
-will be handy in this prospect.
-
----
-
-### Component 3: eBPF Maps Module
-
-To fully use the bpf ecosystem via Lunatik, another value addition would be
-an **eBPF maps module for Lunatik**. This will allow Lunatik to have:
-
-- **Stateful policies**: a Lua DNS handler writes `{ip -> classid}` to a map;
+- *Stateful policies*: a Lua handler writes `{ip -> classid}` to a map;
   the eBPF fast path reads it
-- **Cross-binding composition**: `luaxdp` writes to a map that `luatc` reads,
+- *Cross-binding composition*: `luaxdp` writes to a map that `luatc` reads,
   enabling pipelines that span subsystems
-- **Operator visibility**: Lua scripts read kernel maps to inspect state without
+- *Operator visibility*: Lua scripts read kernel maps to inspect state without
   a separate userspace tool
 
 ```lua
 local map = require("ebpf.map")
 
-local m = map.open_by_id(42)
-
-local classid = m:lookup(dst_ip)
-
--- Update (flags: maps.ANY | maps.NOEXIST | maps.EXIST)
-m:update(dst_ip, new_classid)
-
-m:delete(stale_ip)
-
--- Iterate (hash maps only)
-local next_key = m:next(current_key_buf)  -- nil when exhausted
-
--- or just let GC handle it via __gc -> bpf_map_put
-m:close()
+local flow_table = map.open_by_id(42)
+local classid = flow_table:lookup(dst_ip)
+flow_table:update(src_ip, new_classid)
+flow_table:delete(stale_ip)
 ```
-
-#### Technical homework
 
 eBPF maps are created via `bpf(BPF_MAP_CREATE, ...)` and accessed via
 `bpf_map_lookup_elem`, `bpf_map_update_elem`, and `bpf_map_delete_elem` helpers.
@@ -247,161 +248,30 @@ The following APIs are exposed by kernel to use:
 - [`bpf_map_get_curr_or_next(u32 *id)`](https://elixir.bootlin.com/linux/v6.19.2/source/include/linux/bpf.h#L2536)
 
 `bpf_map_get` will need the file descriptor which needs to be created via
-a userspace process context. However `bpf_lunatik_run` is going to run on softirq
+a userspace process context. However `lunatik_bpf_run` is going to run on softirq
 context. So we could utilize `bpf_map_get_curr_or_next` API.
 
 This will require the map id to be passed.
 
-### Minimal API
+#### Map Creation
+This design requires bpf maps to be created outside Lunatik, via userspace 
+programs like `bpftool`. We can get the map ID once it is created.
 
-```c
-static const luaL_Reg luamap_methods[] = {
-    {"lookup",  luamap_lookup},
-    {"update",  luamap_update},
-    {"delete",  luamap_delete},
-    {"close",   luamap_close},
-    {NULL, NULL}
-};
+#### Map Lookup and usage
+The map ID can be used to lookup the pointer to map in the kernel.
+- `open_by_id()` will return the map pointer and increase the reference counter of the map via [`bpf_map_inc(struct bpf_map *map)`](https://elixir.bootlin.com/linux/v6.19.8/source/kernel/bpf/syscall.c#L1623).
+- `lookup(key)` on the map pointer will return the value stored in the map for the provided key. We can reuse `luadata` for the actual types.
+- `update(key, data)` on the map pointer will update the map for the provided key with the given data.
+- `delete(key)` on the map pointer will delete the key from the map.
+- Once we have the pointer to `struct bpf_map`, we could call kernel ops helpers defined [here](https://elixir.bootlin.com/linux/v6.19.2/source/include/linux/bpf.h#L106) to do lookup, update, delete.
 
-static int luamap_init(lua_State *L) {
-    luaL_newmetatable(L, LUAMAP_MT);
+#### Cleanup
+- `close()` will cleanup the map from Lua, and decrease the reference counter via [`bpf_map_put(struct bpf_map *map)`](https://elixir.bootlin.com/linux/v6.19.2/source/include/linux/bpf.h#L2521)
 
-    lua_pushvalue(L, -1);
-    lua_setfield(L, -2, "__index");
+### First Packet Classification
 
-    lua_pushcfunction(L, luamap_close);
-    lua_setfield(L, -2, "__gc");
-
-    luaL_setfuncs(L, luamap_methods, 0);
-    return 0;
-}
-
-static int luamap_open_by_id(lua_State *L) {
-    u32 id = (u32)luaL_checkinteger(L, 1);
-
-    struct bpf_map *map = bpf_map_get_curr_or_next(&id);
-    if (!map)
-        return luaL_error(L, "map id %u not found", id);
-
-    // allocate userdata to hold struct bpf_map *
-    luamap_data *m = lua_newuserdata(L, sizeof(luamap_data));
-    m->map = map;
-
-    // tag it with our metatable
-    luaL_setmetatable(L, LUAMAP_MT);
-    return 1;  // returns the userdata to Lua
-}
-
-static int luamap_lookup(lua_State *L) {
-    luamap_data *m = luaL_checkudata(L, 1, LUAMAP_MT);
-    ...
-}
-
-static int luamap_close(lua_State *L) {
-    luamap_data *m = luaL_checkudata(L, 1, LUAMAP_MT);
-    if (m->map) {
-        bpf_map_put(m->map);  // decrement refcount
-        m->map = NULL;
-    }
-    return 0;
-}
-```
-
-### Examples using tc and Lua
-
-1. Multi field egress classification
-
-TC filters classify packets into HTB classes, but existing classifiers (u32, flower) 
-can only match static L3/L4 fields. They cannot combine multiple fields with 
-conditional logic. Operators are forced into this pattern:
+1. Setup TC
 ```shell
-iptables -t mangle -A POSTROUTING -p tcp --dport 443 -j MARK --set-mark 0x1
-iptables -t mangle -A POSTROUTING -p udp --dport 53  -j MARK --set-mark 0x1
-tc filter add dev eth0 parent 1:0 handle 0x1 fw classid 1:10
-```
-Problems with this:
-
-- Requires iptables and tc: two subsystems to configure
-- Port-based only, cannot combine port + protocol + packet size + DSCP
-- Static, adding a new rule requires editing iptables and reloading
-- IPv6 variable headers break u32 offset-based matching
-
-This can be conveniently solved via a Lua policy handler.
-
-```lua
--- qos.lua
-local tc = require("tc")
-
-local policy = {
-    -- realtime: VoIP and gaming
-    {
-        match = function(p)
-            return p.protocol == 0x0800          -- IPv4
-               and p:ip_proto() == 17            -- UDP
-               and p.len < 256                   -- small packet
-               and (p:dscp() == 46               -- DSCP Expedited Forwarding
-                    or p.priority >= 6)          -- SO_PRIORITY high
-        end,
-        classid = 0x00010010   -- 1:10 realtime
-    },
-
-    -- bulk: large TCP segments, likely file transfer or backup
-    {
-        match = function(p)
-            return p.protocol == 0x0800
-               and p:ip_proto() == 6             -- TCP
-               and p.len > 1400                  -- near-MTU = bulk transfer
-               and p.priority == 0               -- no special priority set
-        end,
-        classid = 0x00010030   -- 1:30 bulk
-    },
-
-    -- interactive: SSH, DNS
-    {
-        match = function(p)
-            local dport = p:dst_port()
-            return dport == 22                   -- SSH
-                or dport == 53                   -- DNS
-                or dport == 123                  -- NTP
-        end,
-        classid = 0x00010010   -- 1:10 realtime
-    },
-}
-
-local function handler(pkt)
-    for _, rule in ipairs(policy) do
-        if rule.match(pkt) then
-            pkt.tc_classid = rule.classid
-            return tc.action.OK
-        end
-    end
-    return tc.action.OK
-end
-
-tc.attach(handler)
-```
-
-2. DNS-Based Traffic Shaper
-
-**The problem**: Shape traffic to streaming services (Netflix, YouTube) and
-video conferencing (Zoom) into separate HTB classes, without a userspace
-daemon, without static IP lists that go stale as CDNs rotate addresses.
-
-**Why existing tools fail**: DNS responses reveal which IPs belong to which
-domain. But DNS name parsing requires string operations (length-prefixed wire
-format labels, pattern matching against domain names) that the BPF verifier
-cannot express. Plain `tc u32` filters work on L3/L4 fields only. A userspace
-daemon can parse DNS but introduces latency and race conditions between the DNS
-response and the first data packet.
-
-**The luatc solution**: eBPF pre-filters for DNS responses (port 53, UDP).
-`bpf_luatc_run()` is called only for those packets, a low-frequency event.
-Lua parses the DNS wire-format name and matches it against a policy table using
-`string.match`. All other traffic takes the pure eBPF fast path.
-
-#### TC Setup
-
-```bash
 tc qdisc del dev eth0 root 2>/dev/null
 tc qdisc add dev eth0 root handle 1: htb default 30
 
@@ -409,91 +279,81 @@ tc class add dev eth0 parent 1: classid 1:10 htb rate 20mbit  # realtime
 tc class add dev eth0 parent 1: classid 1:20 htb rate 10mbit  # streaming
 tc class add dev eth0 parent 1: classid 1:30 htb rate 5mbit   # bulk/default
 
-tc filter add dev eth0 ingress bpf da obj luatc_dns.o sec classifier
+tc filter add dev eth0 ingress bpf da obj tc.bpf.o sec classifier
 ```
 
-#### eBPF Program
-
+2. eBPF program
 ```c
-SEC("classifier")
-int luatc_dns_shaper(struct __sk_buff *skb)
+extern int bpf_luatc_run(char *key, size_t key__sz, struct __sk_buff *skb, void *arg, size_t arg__sz) __ksym;
+
+SEC("tc")
+int tls_classifier(struct __sk_buff *skb)
 {
-    if (!is_dns_response(skb)) {
-        __u32 dst_ip = get_dst_ip(skb);
-        __u32 *classid = bpf_map_lookup_elem(&ip_class_map, &dst_ip);
-        if (classid)
-            skb->tc_classid = *classid;
+    struct flow_key key = extract_key(skb);
+    // key could be made from src_ip, dst_ip, src_port, dst_port, ip_proto
+    // We could also timestamp the cache entried to handle TCP port reuse.
+
+    __u32 *classid = bpf_map_lookup_elem(&flow_cache, &key);
+    if (classid) {
+        skb->tc_classid = *classid;
         return TC_ACT_OK;
     }
 
-    // slow path: DNS response — delegate to Lua for string matching
-    struct bpf_luatc_arg arg = { .offset = 42 }; // eth+ip+udp
-    return bpf_luatc_run(skb, &arg, sizeof(arg));
+    // only invoke Lua if this looks like a TLS ClientHello
+    if (!is_tls_client_hello(skb))
+        return TC_ACT_OK;
+
+    return bpf_luatc_run(runtime, sizeof(runtime), skb, NULL, 0);
 }
 ```
 
-#### Lua Policy Script
-
+3. Lua policy handler
 ```lua
 local tc  = require("tc")
+local map = require("ebpf.map")
 
--- Policy: Lua patterns -> TC classid
--- BPF C cannot express this: no string ops, no regex, no dynamic tables
+local cache = map.open_by_id(FLOW_CACHE_ID)
+
 local policy = {
-    { pattern = "%.zoom%.us$",         classid = 0x00010010 },
-    { pattern = "%.webex%.com$",       classid = 0x00010010 },
-    { pattern = "%.netflix%.com$",     classid = 0x00010020 },
-    { pattern = "%.nflxvideo%.net$",   classid = 0x00010020 },
-    { pattern = "%.youtube%.com$",     classid = 0x00010020 },
-    { pattern = "%.googlevideo%.com$", classid = 0x00010020 },
-    { pattern = "s3%.amazonaws%.com$", classid = 0x00010030 },
+    ["netflix%.com$"]       = 0x00010030,  -- bulk
+    ["meet%.google%.com$"]  = 0x00010010,  -- realtime
+    ["%.zoom%.us$"]         = 0x00010010,  -- realtime
+    ["%.backup%.internal$"] = 0x00010040,  -- background
 }
 
-local function parse_dns_name(pkt, offset)
-    local labels, i = {}, offset
-    while i < 512 do
-        local len = pkt[i]
-        if len == 0 or len >= 0xC0 then break end
-        local label = {}
-        for j = i+1, i+len do label[#label+1] = string.char(pkt[j]) end
-        labels[#labels+1] = table.concat(label)
-        i = i + len + 1
-    end
-    return table.concat(labels, ".")
+local function parse_sni(p)
+    -- get sni from the packet
 end
 
-local function handler(pkt, arg)
-    local domain = parse_dns_name(pkt, arg.offset + 12)
-    for _, rule in ipairs(policy) do
-        if domain:match(rule.pattern) then
-            pkt.tc_classid = rule.classid
+local function is_tls_hello(p)
+    -- check if the packet is TLS hello
+end
+
+local function handler(p)
+    if not is_tls_hello(p) then return tc.action.OK end
+
+    local sni = parse_sni(p)
+    if not sni then return tc.action.OK end
+
+    for pattern, classid in pairs(policy) do
+        if sni:match(pattern) then
+            cache:update(p:flow_key(), classid)
+            p.tc_classid = classid
             return tc.action.OK
         end
     end
+
     return tc.action.OK
 end
 
 tc.attach(handler)
 ```
 
-#### Why Lua Is Justified Here
-
-| Requirement | BPF C | Lua via `bpf_luatc_run` |
-|---|---|---|
-| DNS wire-format name parsing | Verbose, fragile | Natural with `string.char` |
-| Domain pattern matching (`%.zoom%.us$`) | Not possible | Native `string.match` |
-| Hot-reload policy without BPF reload | Not possible | `lunatik run new_policy` |
-| Set `tc_classid` for HTB shaping | Possible | `pkt.tc_classid = x` |
-
-Lua is invoked **only for DNS responses** perhaps a few packets per second.
-All other traffic takes the pure eBPF fast path. The kfunc overhead is paid
-only where Lua's capabilities are genuinely needed.
-
 ---
 
-### Subsystems That Benefit Beyond TC
+### Future Subsystems That Benefit Beyond TC
 
-The generic `bpf_lunatik_run()` layer enables future bindings across the eBPF
+The generic `lunatik_bpf_run()` layer enables future bindings across the eBPF
 program type space. The most compelling candidates, in priority order:
 
 **`BPF_PROG_TYPE_CGROUP_SKB`**: the strongest next candidate after TC.
@@ -517,85 +377,24 @@ or `connect`. With Lua: dynamic connection policy per container, with pattern
 matching on addresses and ports, hot-reloadable without kernel changes.
 
 Each of these is a future binding, not in scope for this GSoC project. But the
-generic `bpf_lunatik_run()` layer makes each of them straightforward to add.
+generic `lunatik_bpf_run()` layer makes each of them straightforward to add.
 This is precisely the combinatory effect that justifies the infrastructure
 investment.
 
 ---
 
-<<<<<<< HEAD
-=======
-## eBPF Maps Module
-
-To fully use the bpf ecosystem via Lunatik, another value addition would be
-an **eBPF maps module for Lunatik**. This will allow Lunatik to have:
-
-- **Stateful policies**: a Lua DNS handler writes `{ip -> classid}` to a map;
-  the eBPF fast path reads it
-- **Cross-binding composition**: `luaxdp` writes to a map that `luatc` reads,
-  enabling pipelines that span subsystems
-- **Operator visibility**: Lua scripts read kernel maps to inspect state without
-  a separate userspace tool
-
-```lua
-local map = require("ebpf.map")
-
-local flow_table = map.open_by_id(42) -- must be known from bpf userspace tools
-local classid = flow_table:lookup(dst_ip)
-flow_table:update(src_ip, new_classid)
-flow_table:delete(stale_ip)
-```
-
----
-
-### Technical homework
-
-eBPF maps are created via `bpf(BPF_MAP_CREATE, ...)` and accessed via
-`bpf_map_lookup_elem`, `bpf_map_update_elem`, and `bpf_map_delete_elem` helpers.
-We want to access these via kernel's internal map API without going through syscall
-interface.
-
-The following APIs are exposed by kernel to use:
-- All userspace calls (through libbpf) go through [`SYSCALL_DEFINE3()`](https://elixir.bootlin.com/linux/v6.19.2/source/kernel/bpf/syscall.c#L6272)
-- [`bpf_map_get(u32 ufd)`](https://elixir.bootlin.com/linux/v6.19.2/source/include/linux/bpf.h#L2487)
-- [`bpf_map_get_with_uref(u32 ufd)`](https://elixir.bootlin.com/linux/v6.19.2/source/include/linux/bpf.h#L2488)
-- [`bpf_map_get_curr_or_next(u32 *id)`](https://elixir.bootlin.com/linux/v6.19.2/source/include/linux/bpf.h#L2536)
-
-`bpf_map_get` will need the file descriptor which needs to be created via
-a userspace process context. However `bpf_lunatik_run` is going to run on softirq
-context. So we could utilize `bpf_map_get_curr_or_next` API.
-
-This will require the map id to be passed.
-
-### eBPF Map Lifecycle
-
-1. Creation
-This design requires bpf maps to be created outside Lunatik, via userspace 
-programs like `bpftool`. We can get the map ID once it is created.
-
-2. Lookup and usage
-The map ID can be used to lookup the pointer to map in the kernel.
-- `open_by_id()` will return the map pointer and increase the reference counter of the map.
-- `lookup(key)` on the map pointer will return the value stored in the map for the provided key. We can reuse `luadata` for the actual types.
-- `update(key, data)` on the map pointer will update the map for the provided key with the given data.
-- `delete(key)` on the map pointer will delete the key from the map.
-- Once we have the pointer to `struct bpf_map`, we could call kernel ops helpers defined [here](https://elixir.bootlin.com/linux/v6.19.2/source/include/linux/bpf.h#L106) to do lookup, update, delete.
-
-3. Cleanup
-- `close()` will cleanup the map from Lua, and decrease the reference counter via [`bpf_map_put(struct bpf_map *map)`](https://elixir.bootlin.com/linux/v6.19.2/source/include/linux/bpf.h#L2521)
-
----
-
 ## Why This Project?
 
-Linux is going all the way with eBPF. That is a fact. But eBPF optimises for
-verifiability and performance, not expressiveness. The BPF verifier is a
-constraint, not just a safety mechanism, it bounds what policy logic you can
-write. Lua does not have that constraint. It is small enough to live in the
-kernel, flexible enough to express the policy logic eBPF cannot, and simple
-enough that operators who cannot write BPF C can write Lua scripts.
+I have always been interested in how computers works and how we can
+tweak certain parts to get our job done. I find Lunatik very
+interesting in the sense that it tries to achieve something bold:
+kernel scripting with a high level language.
 
-The `bpf_lunatik_run()` layer is the bridge: eBPF defines the structure, Lua
-defines the policy. Each new binding added on top of this layer multiplies the
-scripting surface available to the kernel. That combinatory effect is the reason
-this infrastructure matters.
+Lunatik helped me understand how Lua is actually a glue language
+for already running systems. It is lightweight, embeddable, and
+expressive enough to implement the dynamic logic.
+
+Instead of building isolated bindings, the proposed infrastructure allows
+future Lunatik modules across multiple subsystems to reuse the same
+mechanism, multiplying the scripting capabilities of the kernel.
+
