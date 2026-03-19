@@ -135,7 +135,7 @@ register_btf_kfunc_id_set(
 );
 ```
 
-This restricts them to specific program types such as BPF_PROG_TYPE_SCHED_CLS.
+This restricts them to specific program types such as `BPF_PROG_TYPE_SCHED_CLS`.
 
 #### Generic interface
 
@@ -175,7 +175,7 @@ TC classifiers to delegate processing to different Lua handlers.
 Each kfunc is registered for its specific `bpf_prog_type` via
 `BTF_KFUNCS_START` / `BTF_KFUNCS_END`, maintaining verifier safety.
 
-=== Traffic Control Binding (luatc)
+### Traffic Control Binding (luatc)
 
 Traffic Control is the primary demonstration of the generic layer. TC operates
 on `__sk_buff` and is the place in the kernel with several capabilities:
@@ -186,18 +186,17 @@ on `__sk_buff` and is the place in the kernel with several capabilities:
 
 None of these are available at XDP. TC is where shaping decisions are made.
 Lua is where complex policy logic: string matching, pattern tables,
-dynamic rules, is expressed. The two are complementary.
+dynamic rules, is expressed.
 
-The `__sk_buff` is exposed to Lua as a `luatc_data` userdata:
+We can extend the recently merged `luaskb` module which provides an
+abstraction to `__sk_buff` data structure:
 ```lua
-pkt[i]           -- raw byte at offset i (skb->data)
-pkt:len()        -- skb->len
-pkt.mark         -- skb->mark           (r/w)
-pkt.priority     -- skb->priority       (r/w)
-pkt.tc_index     -- skb->tc_index       (r/w)
-pkt.tc_classid   -- skb->tc_classid     (r/w)
-pkt.protocol     -- skb->protocol       (r)
-pkt.tstamp       -- skb->tstamp         (r/w)
+skb.mark         -- skb->mark           (r/w)
+skb.priority     -- skb->priority       (r/w)
+skb.tc_index     -- skb->tc_index       (r/w)
+skb.tc_classid   -- skb->tc_classid     (r/w)
+skb.protocol     -- skb->protocol       (r)
+skb.tstamp       -- skb->tstamp         (r/w)
 ```
 
 ```lua
@@ -230,7 +229,7 @@ this will allow Lunatik to have:
 ```lua
 local map = require("ebpf.map")
 
-local flow_table = map.open_by_id(42)
+local flow_table = map.open("/sys/fs/bpf/flow_cache")
 local classid = flow_table:lookup(dst_ip)
 flow_table:update(src_ip, new_classid)
 flow_table:delete(stale_ip)
@@ -245,21 +244,60 @@ The following APIs are exposed by kernel to use:
 - All userspace calls (through libbpf) go through [`SYSCALL_DEFINE3()`](https://elixir.bootlin.com/linux/v6.19.2/source/kernel/bpf/syscall.c#L6272)
 - [`bpf_map_get(u32 ufd)`](https://elixir.bootlin.com/linux/v6.19.2/source/include/linux/bpf.h#L2487)
 - [`bpf_map_get_with_uref(u32 ufd)`](https://elixir.bootlin.com/linux/v6.19.2/source/include/linux/bpf.h#L2488)
-- [`bpf_map_get_curr_or_next(u32 *id)`](https://elixir.bootlin.com/linux/v6.19.2/source/include/linux/bpf.h#L2536)
 
 `bpf_map_get` will need the file descriptor which needs to be created via
-a userspace process context. However `lunatik_bpf_run` is going to run on softirq
-context. So we could utilize `bpf_map_get_curr_or_next` API.
-
-This will require the map id to be passed.
+a process context.
 
 #### Map Creation
 This design requires bpf maps to be created outside Lunatik, via userspace 
-programs like `bpftool`. We can get the map ID once it is created.
+programs like `bpftool`.
+
+```
+bpftool map create /sys/fs/bpf/flow_cache type hash key 4 value 4 entries 128 name flow_cache
+```
 
 #### Map Lookup and usage
-The map ID can be used to lookup the pointer to map in the kernel.
-- `open_by_id()` will return the map pointer and increase the reference counter of the map via [`bpf_map_inc(struct bpf_map *map)`](https://elixir.bootlin.com/linux/v6.19.8/source/kernel/bpf/syscall.c#L1623).
+Map resolution happens once during script initialization via open(path), which
+runs in process context inside `driver:write()`. The resolved `struct bpf_map*` is
+stored in a Lua userdata and reused by all subsequent lookup/update/delete
+calls. These are safe to call from softirq. 
+
+bpffs intentionally blocks `filp_open` on pinned objects.
+Instead we use `kern_path` to resolve the dentry without triggering the open
+handler, then read `inode->i_private` directly where bpffs stores the `struct
+bpf_map*`. 
+
+> [!NOTE]
+> This has been verified via a kernel module POC.
+
+```c
+static int luabpf_map_open(lua_State *L)
+{
+    const char *path = luaL_checkstring(L, 1);
+    struct path kpath;
+    struct bpf_map *map;
+    struct bpf_map **udata;
+    int err;
+
+    err = kern_path(path, LOOKUP_FOLLOW, &kpath);
+    if (err)
+        return luaL_error(L, "kern_path failed: %d", err);
+
+    map = d_inode(kpath.dentry)->i_private;
+    path_put(&kpath);
+
+    if (!map || IS_ERR(map))
+        return luaL_error(L, "not a valid bpf map path");
+
+    bpf_map_inc(map); // increase reference counter
+
+    udata = lua_newuserdata(L, sizeof(struct bpf_map *));
+    *udata = map;
+    luaL_setmetatable(L, "bpf.map");
+    return 1;
+}
+```
+
 - `lookup(key)` on the map pointer will return the value stored in the map for the provided key. We can reuse `luadata` for the actual types.
 - `update(key, data)` on the map pointer will update the map for the provided key with the given data.
 - `delete(key)` on the map pointer will delete the key from the map.
@@ -350,6 +388,64 @@ tc.attach(handler)
 ```
 
 ---
+
+## Benchmarks and Evaluation
+
+I have tried writing a TC implementation similar to XDP in
+`sneaky-potato/luatc` branch of the project. Link [here](https://github.com/luainkernel/lunatik/tree/sneaky-potato/luatc)
+
+I tested two scenarios: pure eBPF program emitting `TC_ACT_OK`
+for each packet and one eBPF program calling `bpf_tc_run` which
+returns `tc.action.OK` for each packet.
+
+I attached the following kprobe to measure latency.
+
+```
+sudo bpftrace -e '
+kprobe:tcf_classify { @start[tid] = nsecs; }
+kretprobe:tcf_classify {
+    if (@start[tid]) {
+        @lat = hist(nsecs - @start[tid]);
+        delete(@start[tid]);
+    }
+}'
+```
+
+The results:
+| Metric Percentile | eBPF | eBPF + Lua TC |
+| --- | --- | --- |
+| p50 | ~3µs  | ~6µs  |
+| p90 | ~6µs  | ~12µs |
+| p99 | ~20µs | ~40µs |
+
+Pure eBPF path
+```
+@lat:
+[128, 256)            36 |                                                    |
+[256, 512)           125 |@@                                                  |
+[512, 1K)            251 |@@@@@                                               |
+[1K, 2K)             797 |@@@@@@@@@@@@@@@@                                    |
+[2K, 4K)            2500 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[4K, 8K)            1737 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@                |
+[8K, 16K)            255 |@@@@@                                               |
+[16K, 32K)            60 |@                                                   |
+[32K, 64K)            20 |                                                    |
+```
+
+eBPF classifier calling `bpf_luatc_run`
+```
+@lat:
+[512, 1K)              8 |                                                    |
+[1K, 2K)             118 |@@                                                  |
+[2K, 4K)             270 |@@@@@@                                              |
+[4K, 8K)            2216 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[8K, 16K)           1655 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@              |
+[16K, 32K)           278 |@@@@@@                                              |
+[32K, 64K)            13 |                                                    |
+[64K, 128K)            1 |                                                    |
+```
+
+This hints to use Lua only when required, on slow paths.
 
 ### Future Subsystems That Benefit Beyond TC
 
