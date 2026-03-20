@@ -64,7 +64,10 @@
   [*Matrix ID*], [\@sneaky-potato:matrix.org],
   [*Academic Background*], [I graduated from IIT Kharagpur in 2024, with
   Bachelor of Technology in Computer Science and Engineering],
-  [*Time Commitments During GSoC*], [I can dedicate 30-35 hours per week to the project],
+  [*Time Commitments During GSoC*], [I can dedicate 30-35 hours per week to the
+  project. I do have a day job but I will be able to take time out to do this. 
+  My working hours are flexible, and I intend to use my off times and weekends
+  for GSoC.],
 )
 
 = Experience
@@ -123,7 +126,7 @@ language inspired by Forth for x86\_64 architectures.
 The compiler, emits x86\_64 assembly and produces statically linked ELF 
 binaries for Linux. The project includes a lexer, parser, stack-based 
 intermediate representation, type checking, and a runtime supporting 
-control flow, recursion, and system calls.
+control flow, procedures, and system calls.
 
 - *Route Optimization Backend (Inter IIT Tech Meet)* (Competition): 
 Developed backend services for a delivery route planning system used during 
@@ -140,13 +143,13 @@ design.
 I have been actively exploring and contributing to the Lunatik ecosystem,
 which enables Lua scripting within the Linux kernel.
 
-While studying the existing implementation of Lunatik modules, I worked
+While studying the existing implementation of *Lunatik* modules, I worked
 on improving the method dispatch mechanism used by Lua objects in the
 kernel runtime. By replacing repeated table lookups with eager closure
-wrapping, I reduced method call overhead from roughly 275ns to 128ns in
+wrapping, I reduced method call overhead from roughly 275ns to 98ns in
 benchmark tests across one million iterations.
 
-In addition to Lunatik, I have also contributed patches to the etcd
+In addition to Lunatik, I have also contributed patches to the *etcd*
 project, focusing on improving the correctness and determinism of the
 robustness testing framework by removing redundant delete and compact
 operations.
@@ -166,10 +169,7 @@ operations.
 I have selected the project *Lunatik Binding for Linux Traffic Control (TC) and
 eBPF Maps* which is from the idea list.
 
-While working on Lunatik I always compared scenarios with eBPF because it
-exists to serve a similar purpose for kernel: *scripting*.
-
-I noticed while contributing to Lunatik that to run Lua callbacks from bpf programs
+I noticed while contributing, that to run Lua callbacks from bpf programs
 there was one hook `bpf_luaxdp_run` but it was tightly coupled to xdp
 and that the abstraction layer was missing.
 
@@ -214,8 +214,8 @@ its core architecture.
 
 This project follows a simple design pattern:
 
-- *eBPF defines structure and safe hooks*
-- *Lua implements dynamic policy logic*
+- *eBPF defines structure and safe hooks: fast path*
+- *Lua implements dynamic policy logic: slow path*
 
 The idea is to allow eBPF programs to delegate complex decisions to
 Lua handlers inside Lunatik.
@@ -402,12 +402,11 @@ We want to access these via kernel's internal map API without going through sysc
 interface.
 
 The following APIs are exposed by kernel to use:
-- All userspace calls (through libbpf) go through #link("https://elixir.bootlin.com/linux/v6.19.2/source/kernel/bpf/syscall.c#L6272")[`SYSCALL_DEFINE3()`]
 - #link("https://elixir.bootlin.com/linux/v6.19.2/source/include/linux/bpf.h#L2487")[`bpf_map_get(u32 ufd)`]
 - #link("https://elixir.bootlin.com/linux/v6.19.2/source/include/linux/bpf.h#L2488")[`bpf_map_get_with_uref(u32 ufd)`]
 
-`bpf_map_get` will need the file descriptor which needs to be created via
-a process context.
+These will need the file descriptor which needs to be created via
+a userspace process context.
 
 ==== Map Creation
 This design requires bpf maps to be created outside Lunatik, via userspace 
@@ -418,14 +417,22 @@ bpftool map create /sys/fs/bpf/flow_cache type hash key 4 value 4 entries 128 na
 ```
 
 ==== Map Lookup and usage
-Map resolution happens once during script initialization via open(path), which
-runs in process context inside `driver:write()`. The resolved `struct bpf_map*` is
-stored in a Lua userdata and reused by all subsequent lookup/update/delete
-calls. These are safe to call from softirq. 
 
-bpffs intentionally blocks `filp_open` on pinned objects.
-Instead we use `kern_path` to resolve the dentry without triggering the open
-handler, then read `inode->i_private` directly where bpffs stores the `struct bpf_map*`. 
+Map resolution should happen as follows:
+- from userspace we call open(path) to get an fd on the pinned bpffs file (this could happen inside `/bin/lunatik`)
+- now we share this fd to kernel side via the lunatik driver (from `/bin/lunatik` to `/dev/lunatik`)
+- now we can call `bpf_map_get_with_uref(u32 ufd)` from kernel side to resolve the fd to `struct bpf_map *`
+
+The resolved `struct bpf_map*` is stored in a Lua userdata and reused by 
+all subsequent lookup/update/delete calls. These are safe to call from softirq.
+
+This approach will require adding a userspace bpf helper method to be called from `/bin/lunatik`.
+Hence changes might be required in both `/bin/lunatik` and `driver.lua`
+
+The other approach, bypasses using the standard way and uses kernel helpers to
+resolve map pointer directly from bpffs path. We can use `kern_path` to resolve 
+the dentry without triggering the open handler, then read `inode->i_private` 
+directly where bpffs stores the `struct bpf_map*`. 
 
 This has been verified via a kernel module POC.
 
@@ -456,6 +463,8 @@ static int luabpf_map_open(lua_State *L)
     return 1;
 }
 ```
+
+Both approaches should work, we can discuss which could be better for Lunatik's eBPF long term support.
 
 - `lookup(key)` on the map pointer will return the value stored in the map for the provided key. We can reuse `luadata` for the actual types.
 - `update(key, data)` on the map pointer will update the map for the provided key with the given data.
@@ -522,7 +531,7 @@ int tls_classifier(struct __sk_buff *skb)
 {
     struct flow_key key = extract_key(skb);
     // key could be made from src_ip, dst_ip, src_port, dst_port, ip_proto
-    // We could also timestamp the cache entried to handle TCP port reuse.
+    // We could also timestamp the cache entries to handle TCP port reuse.
 
     __u32 *classid = bpf_map_lookup_elem(&flow_cache, &key);
     if (classid) {
@@ -556,13 +565,7 @@ local function parse_sni(p)
     -- get sni from the packet
 end
 
-local function is_tls_hello(p)
-    -- check if the packet is TLS hello
-end
-
 local function handler(p)
-    if not is_tls_hello(p) then return tc.action.OK end
-
     local sni = parse_sni(p)
     if not sni then return tc.action.OK end
 
@@ -586,10 +589,10 @@ I have tried writing a TC implementation similar to XDP in
 `sneaky-potato/luatc` branch of the project. Link #link("https://github.com/luainkernel/lunatik/tree/sneaky-potato/luatc")[here]
 
 I tested two scenarios: pure eBPF program emitting `TC_ACT_OK`
-for each packet and one eBPF program calling `bpf_tc_run` which
+for each packet and one eBPF program calling `bpf_luatc_run` which
 returns `tc.action.OK` for each packet.
 
-I attached the following kprobe to measure latency.
+I attached the following kprobe to measure latency in both the cases.
 
 ```
 sudo bpftrace -e '
@@ -603,45 +606,25 @@ kretprobe:tcf_classify {
 ```
 
 The results:
-Pure eBPF:
-- p50: ~3µs
-- p95: ~6µs
-- p99: ~20µ
+#table(
+  columns: (40%, 30%, 30%),
+  stroke: (paint: rgb("#E2E8F0"), thickness: 0.8pt),
+  fill: (_, row) => if calc.odd(row) { light } else { white },
+  inset: (x: 8pt, y: 7pt),
 
-eBPF + Lua TC:
-- p50: ~6µs
-- p95: ~12µs
-- p99: ~40µ
-
-Pure eBPF path
-```
-@lat:
-[128, 256)            36 |                                               |
-[256, 512)           125 |@@                                             |
-[512, 1K)            251 |@@@@@                                          |
-[1K, 2K)             797 |@@@@@@@@@@@@@@@@                               |
-[2K, 4K)            2500 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
-[4K, 8K)            1737 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@           |
-[8K, 16K)            255 |@@@@@                                          |
-[16K, 32K)            60 |@                                              |
-[32K, 64K)            20 |                                               |
-```
-
-eBPF classifier calling `bpf_luatc_run`
-```
-@lat:
-[512, 1K)              8 |                                               |
-[1K, 2K)             118 |@@                                             |
-[2K, 4K)             270 |@@@@@@                                         |
-[4K, 8K)            2216 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
-[8K, 16K)           1655 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@         |
-[16K, 32K)           278 |@@@@@@                                         |
-[32K, 64K)            13 |                                               |
-[64K, 128K)            1 |                                               |
-```
+  table.header(
+    table.cell(fill: teal-d)[#text(fill: white, weight: "bold")[Percentile]],
+    table.cell(fill: teal-d)[#text(fill: white, weight: "bold")[Pure eBPF]],
+    table.cell(fill: teal-d)[#text(fill: white, weight: "bold")[eBPF + Lua TC]],
+  ),
+  [p50], [~3µs], [~6µs],
+  [p95], [~6µs], [~12µs],
+  [p99], [~20µs], [~40µs],
+)
 
 This hints to use Lua only when required, on slow paths.
 
+Similar benchmarking need to be performed with the demonstration scripts.
 
 == Expected Results
 
@@ -699,10 +682,14 @@ At the end of the project:
 - eBPF maps Lua API
 - Examples and documentation
 
+= Future Scope
+
+We can target more subsystems with this generic bpf layer.
+
 = Why This Project
 
-I have always been interested in how computers works and how we can
-tweak certain parts to get our job done. I find Lunatik very
+I have always been interested in how operating systems work and how we 
+can tweak certain parts to get our job done. I find Lunatik very
 interesting in the sense that it tries to achieve something bold:
 kernel scripting with a high level language.
 
@@ -713,3 +700,4 @@ expressive enough to implement the dynamic logic.
 Instead of building isolated bindings, the proposed infrastructure allows
 future Lunatik modules across multiple subsystems to reuse the same
 mechanism, multiplying the scripting capabilities of the kernel.
+
