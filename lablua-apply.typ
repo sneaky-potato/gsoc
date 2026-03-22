@@ -170,7 +170,7 @@ I have selected the project *Lunatik Binding for Linux Traffic Control (TC) and
 eBPF Maps* which is from the idea list.
 
 I noticed while contributing, that to run Lua callbacks from bpf programs
-there was one hook `bpf_luaxdp_run` but it was tightly coupled to xdp
+there was one hook `bpf_luaxdp_run` but it was tightly coupled to XDP
 and that the abstraction layer was missing.
 
 While doing the technical reading required for this project I realized how Lua
@@ -303,16 +303,25 @@ This restricts them to specific program types such as `BPF_PROG_TYPE_SCHED_CLS`.
 Shared internal function that any type-specific kfunc can call:
 
 ```c
-typedef int (*lunatik_bpf_cb)(lua_State *L, void *ctx);
+typedef int  (*lunatik_bpf_input_cb)(lua_State *L, void *ctx);
+typedef void (*lunatik_bpf_output_cb)(lua_State *L, void *result);
 
-int lunatik_bpf_run(const char *runtime_name, lunatik_bpf_cb push_ctx, void *ctx);
+int lunatik_bpf_run(
+    const char           *runtime,
+    lunatik_bpf_input_cb  push_ctx,   // pushes input context onto Lua stack
+    void                 *ctx,
+    lunatik_bpf_output_cb read_result, // reads output from stack into result
+    void                 *result       // caller-allocated result buffer
+);
 ```
 
 This function:
 1. Looks up the named Lunatik runtime
 2. Calls `push_ctx(L, ctx)` to push the context onto the Lua stack as a typed userdata
 3. Invokes the registered Lua handler
-4. Reads and returns the verdict
+4. Calls `read_result(L, result)` to read however many return values the
+   subsystem expects off the Lua stack into the caller-allocated buffer
+5. Cleans the Lua stack
 
 Type-specific kfuncs then become thin wrappers:
 
@@ -320,13 +329,17 @@ Type-specific kfuncs then become thin wrappers:
 // bpf_luaxdp_run will get refactored, behaviour unchanged
 __bpf_kfunc int bpf_luaxdp_run(struct xdp_md *ctx, ...)
 {
-    return lunatik_bpf_run(runtime, luaxdp_push_ctx, ctx);
+    struct luaxdp_result result = { .action = XDP_PASS };
+    lunatik_bpf_run(runtime, luaxdp_push_ctx, ctx, luaxdp_read_result, &result);
+    return result.action;
 }
 
 // bpf_luatc_run will be a new addition
 __bpf_kfunc int bpf_luatc_run(struct __sk_buff *skb, ...)
 {
-    return lunatik_bpf_run(runtime, luatc_push_ctx, skb);
+    struct luatc_result result = { .action = TC_ACT_OK };
+    lunatik_bpf_run(runtime, luatc_push_ctx, skb, luatc_read_result, &result);
+    return result.action;
 }
 ```
 
@@ -374,6 +387,10 @@ tc.attach(handler)    -- register Lua callback
 tc.detach()           -- unregister
 ```
 
+The Lua handler returns a single integer, the TC verdict. `luatc_read_result`
+reads `lua_tointeger(L, -1)`, making the output path as thin as possible while
+remaining consistent with the generic interface used by all subsytems.
+
 === eBPF Maps Module
 
 To fully use the bpf ecosystem via Lunatik, we need access to shared kernel
@@ -411,6 +428,8 @@ a userspace process context.
 ==== Map Creation
 This design requires bpf maps to be created outside Lunatik, via userspace 
 programs like `bpftool`.
+Maps are created in userspace and pinned to bpffs, allowing them to persist 
+independently and be shared across subsystems.
 
 ```
 bpftool map create /sys/fs/bpf/flow_cache type hash key 4 value 4 entries 128 name flow_cache
@@ -421,9 +440,9 @@ bpftool map create /sys/fs/bpf/flow_cache type hash key 4 value 4 entries 128 na
 Map resolution should happen as follows:
 - from userspace we call open(path) to get an fd on the pinned bpffs file (this could happen inside `/bin/lunatik`)
 - now we share this fd to kernel side via the lunatik driver (from `/bin/lunatik` to `/dev/lunatik`)
-- now we can call `bpf_map_get_with_uref(u32 ufd)` from kernel side to resolve the fd to `struct bpf_map *`
+- now we can call `bpf_map_get_with_uref(u32 ufd)` from kernel side to resolve the fd to pointer to `struct bpf_map`
 
-The resolved `struct bpf_map*` is stored in a Lua userdata and reused by 
+The resolved pointer to `struct bpf_map` is stored in a Lua userdata and reused by 
 all subsequent lookup/update/delete calls. These are safe to call from softirq.
 
 This approach will require adding a userspace bpf helper method to be called from `/bin/lunatik`.
@@ -432,7 +451,7 @@ Hence changes might be required in both `/bin/lunatik` and `driver.lua`
 The other approach, bypasses using the standard way and uses kernel helpers to
 resolve map pointer directly from bpffs path. We can use `kern_path` to resolve 
 the dentry without triggering the open handler, then read `inode->i_private` 
-directly where bpffs stores the `struct bpf_map*`. 
+directly where bpffs stores the pointer to `struct bpf_map`. 
 
 This has been verified via a kernel module POC.
 
@@ -552,7 +571,7 @@ int tls_classifier(struct __sk_buff *skb)
 local tc  = require("tc")
 local map = require("ebpf.map")
 
-local cache = map.open_by_id(FLOW_CACHE_ID)
+local cache = map.open("/sys/fs/bpf/flow_cache")
 
 local policy = {
     ["netflix%.com$"]       = 0x00010030,  -- bulk
@@ -571,7 +590,7 @@ local function handler(p)
 
     for pattern, classid in pairs(policy) do
         if sni:match(pattern) then
-            cache:update(p:flow_key(), classid)
+            cache:update(flow_key(p), classid)
             p.tc_classid = classid
             return tc.action.OK
         end
@@ -586,14 +605,15 @@ tc.attach(handler)
 == Benchmarks and Evaluation
 
 I have tried writing a TC implementation similar to XDP in
-`sneaky-potato/luatc` branch of the project. Link #link("https://github.com/luainkernel/lunatik/tree/sneaky-potato/luatc")[here]
+`sneaky-potato/luatc` branch of the project. Link #link("https://github.com/luainkernel/lunatik/tree/sneaky-potato/luatc")[here].
 
-I tested two scenarios: pure eBPF program emitting `TC_ACT_OK`
-for each packet and one eBPF program calling `bpf_luatc_run` which
-returns `tc.action.OK` for each packet.
+I evaluated two scenarios:
+- A pure eBPF program returning `TC_ACT_OK` for each packet (baseline fast path)
+- An eBPF program invoking `bpf_luatc_run`, which executes a Lua script returning 
+`tc.action.OK`
 
-I attached the following kprobe to measure latency in both the cases.
-
+I attached the following kprobe (this will measure the latency to _classify_
+packets) to measure latency in both the cases.
 ```
 sudo bpftrace -e '
 kprobe:tcf_classify { @start[tid] = nsecs; }
@@ -624,7 +644,7 @@ The results:
 
 This hints to use Lua only when required, on slow paths.
 
-Similar benchmarking need to be performed with the demonstration scripts.
+Similar benchmarking needs to be performed with the demonstration scripts.
 
 == Expected Results
 
