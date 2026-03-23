@@ -39,7 +39,7 @@
   #text(size: 18pt)[Lunatik eBPF Abstraction Layer]
   #v(0.1cm)
 
-  #text(size: 16pt)[Binding for Linux Traffic Control (TC) and eBPF Maps]
+  #text(size: 16pt)[Bindings for Linux Traffic Control (TC), Linux Scheduler and eBPF Maps]
 
   #v(0.8cm)
 
@@ -166,7 +166,7 @@ operations.
 
 = Project
 
-I have selected the project *Lunatik Binding for Linux Traffic Control (TC) and
+I started out with the project *Lunatik Binding for Linux Traffic Control (TC) and
 eBPF Maps* which is from the idea list.
 
 I noticed while contributing, that to run Lua callbacks from bpf programs
@@ -176,6 +176,9 @@ and that the abstraction layer was missing.
 While doing the technical reading required for this project I realized how Lua
 could be used as a high level abstraction to further increase the expressiveness
 of eBPF programs.
+
+Hence I propose *Lunatik eBPF Abstraction Layer* which targets multiple Linux
+subsystems.
  
 == Selected Idea
 
@@ -278,6 +281,7 @@ This could provide with inspiration for future kfunc support by Lunatik.
 ```c
 __bpf_kfunc int bpf_luaxdp_run(struct xdp_md *ctx, ...);
 __bpf_kfunc int bpf_luatc_run(struct __sk_buff *skb, ...);
+__bpf_kfunc int bpf_luasched_run(struct task_struct *task, struct luasched_result *result, ...);
 ```
 
 The functions are then registered with the BPF subsystem.
@@ -341,10 +345,17 @@ __bpf_kfunc int bpf_luatc_run(struct __sk_buff *skb, ...)
     lunatik_bpf_run(runtime, luatc_push_ctx, skb, luatc_read_result, &result);
     return result.action;
 }
+
+// bpf_luasched_run will be a new addition
+__bpf_kfunc int bpf_luasched_run(struct task_struct *task, struct luasched_result *result)
+{
+    lunatik_bpf_run(runtime, luasched_push_ctx, task, luasched_read_result, result);
+    return 0;
+}
 ```
 
-The `runtime` parameter allows multiple Lua runtimes to coexist, enabling different 
-TC classifiers to delegate processing to different Lua handlers.
+The `runtime` parameter allows multiple Lua runtimes to coexist, enabling different
+programs to delegate processing to different Lua handlers.
 
 Each kfunc is registered for its specific `bpf_prog_type` via
 `BTF_KFUNCS_START` / `BTF_KFUNCS_END`, maintaining verifier safety.
@@ -390,6 +401,42 @@ tc.detach()           -- unregister
 The Lua handler returns a single integer, the TC verdict. `luatc_read_result`
 reads `lua_tointeger(L, -1)`, making the output path as thin as possible while
 remaining consistent with the generic interface used by all subsytems.
+
+=== Scheduler Binding (luasched)
+
+Linux kernel 6.12 introduced #link("https://docs.kernel.org/scheduler/sched-ext.html")[sched_ext] (extensible scheduler) as a new
+scheduling class that allows pluggable CPU schedulers via eBPF.
+
+This enables implementing and dynamically loading thread schedulers. No need
+for recompiling the kernel and rebooting.
+
+#link("https://github.com/sched-ext/scx/")[sched-ext/scx] project is a collection of sched_ext schedulers and tools. 
+
+With the new generic `lunatik_bpf_run` layer we can start targeting
+other subsystems and scheduler is the primary fit.
+
+sched_ext operates mostly around #link("https://elixir.bootlin.com/linux/v6.19.9/source/include/linux/sched.h#L820")[`struct task_struct`]
+and we will need to write the bindings for this on Lua side.
+```lua
+local task = require("sched.task")
+
+task.pid    -- task_struct->pid       (r)
+task.comm   -- task_struct->comm      (r)
+task.prio   -- task_struct->prio      (r/w)
+```
+
+```lua
+local sched = require("sched")
+
+sched.dsq.GLOBAL         -- SCX_DSQ_GLOBAL
+sched.dsq.LOCAL          -- SCX_DSQ_LOCAL
+
+sched.slice.DEFAULT      -- SCX_SLICE_DFL
+sched.slice.BYPASS       -- SCX_SLICE_BYPASS
+
+sched.attach(handler)    -- register Lua callback
+sched.detach()           -- unregister
+```
 
 === eBPF Maps Module
 
@@ -455,34 +502,6 @@ directly where bpffs stores the pointer to `struct bpf_map`.
 
 This has been verified via a kernel module POC.
 
-```c
-static int luabpf_map_open(lua_State *L)
-{
-    const char *path = luaL_checkstring(L, 1);
-    struct path kpath;
-    struct bpf_map *map;
-    struct bpf_map **udata;
-    int err;
-
-    err = kern_path(path, LOOKUP_FOLLOW, &kpath);
-    if (err)
-        return luaL_error(L, "kern_path failed: %d", err);
-
-    map = d_inode(kpath.dentry)->i_private;
-    path_put(&kpath);
-
-    if (!map || IS_ERR(map))
-        return luaL_error(L, "not a valid bpf map path");
-
-    bpf_map_inc(map); // increase reference counter
-
-    udata = lua_newuserdata(L, sizeof(struct bpf_map *));
-    *udata = map;
-    luaL_setmetatable(L, "bpf.map");
-    return 1;
-}
-```
-
 Both approaches should work, we can discuss which could be better for Lunatik's eBPF long term support.
 
 - `lookup(key)` on the map pointer will return the value stored in the map for the provided key. We can reuse `luadata` for the actual types.
@@ -528,6 +547,9 @@ Both approaches should work, we can discuss which could be better for Lunatik's 
 )
 
 === First Packet Classification
+
+This demo will use eBPF TC classifier to check if a packet is SNI, then invoke the Lua
+callback and classify the packet and cache the result in a map.
 
 1. Setup TC
 ```shell
@@ -602,6 +624,112 @@ end
 tc.attach(handler)
 ```
 
+=== Workload scheduling
+
+Lua should not be invoked on every scheduling decision; it is restricted to
+cold-path classification with results cached in BPF maps. This example will use
+eBPF program invoking Lua for implementing the enqueue logic with the help of
+maps.
+
+1. Define queues and dispatch logic
+```c
+#define DSQ_REALTIME  0
+#define DSQ_BATCH     1
+#define DSQ_DEFAULT   2
+
+s32 BPF_STRUCT_OPS(luasched_init)
+{
+    scx_bpf_create_dsq(DSQ_REALTIME, -1);
+    scx_bpf_create_dsq(DSQ_BATCH,    -1);
+    scx_bpf_create_dsq(DSQ_DEFAULT,  -1);
+    return 0;
+}
+
+void BPF_STRUCT_OPS(luasched_dispatch, s32 cpu, struct task_struct *prev)
+{
+    /* drain realtime first, then batch, then default */
+    if (!scx_bpf_consume(DSQ_REALTIME))
+        if (!scx_bpf_consume(DSQ_BATCH))
+            scx_bpf_consume(DSQ_DEFAULT);
+}
+```
+
+2. Implement hooks in eBPF and call `bpf_luasched_run` kfunc
+```c
+extern int bpf_luasched_run(struct task_struct *p, struct luasched_result *result) __ksym;
+
+static char runtime[] = "examples/sched/workload";
+
+struct task_class {
+    __u32 dsq;
+    __u32 slice_ns;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u32);               /* pid */
+    __type(value, struct task_class);
+} task_classes SEC(".maps");
+
+void BPF_STRUCT_OPS(luasched_enqueue, struct task_struct *p, u64 enq_flags)
+{
+    struct task_class *cls = bpf_map_lookup_elem(&task_classes, &p->pid);
+
+    if (!cls) {
+        struct luasched_result result = {
+            .dsq      = DSQ_DEFAULT,
+            .slice_ns = SCX_SLICE_DFL,
+        };
+        bpf_luasched_run(p, &result);
+
+        struct task_class new_cls = {
+            .dsq      = result.dsq,
+            .slice_ns = result.slice_ns,
+        };
+        bpf_map_update_elem(&task_classes, &p->pid, &new_cls, BPF_ANY);
+        scx_bpf_dispatch(p, result.dsq, result.slice_ns, 0);
+        return;
+    }
+
+    scx_bpf_dispatch(p, cls->dsq, cls->slice_ns, 0);
+}
+
+void BPF_STRUCT_OPS(luasched_exit_task, struct task_struct *p, struct scx_exit_task_args *args)
+{
+    bpf_map_delete_elem(&task_classes, &p->pid);
+}
+
+SCX_OPS_DEFINE(luasched_ops,
+    .enqueue   = (void *)luasched_enqueue,
+    .dispatch  = (void *)luasched_dispatch,
+    .exit_task = (void *)luasched_exit_task,
+    .init      = (void *)luasched_init,
+    .name      = "luasched");
+```
+
+3. Lua callback
+```lua
+local sched = require("sched")
+
+local REALTIME = 0
+local BATCH    = 1
+
+local policy = {
+    { pattern = "^nginx",  dsq = REALTIME, slice = 1000000  }, --  1ms
+    { pattern = "^ffmpeg", dsq = BATCH,    slice = 10000000 }, -- 10ms
+}
+
+sched.attach(function(task)
+    for _, rule in ipairs(policy) do
+        if task.comm:match(rule.pattern) then
+            return rule.dsq, rule.slice
+        end
+    end
+    return sched.dsq.DEFAULT, sched.slice.DEFAULT
+end)
+```
+
 == Benchmarks and Evaluation
 
 I have tried writing a TC implementation similar to XDP in
@@ -644,7 +772,7 @@ The results:
 
 This hints to use Lua only when required, on slow paths.
 
-Similar benchmarking needs to be performed with the demonstration scripts.
+Similar benchmarking needs to be performed with all the demonstration scripts.
 
 == Expected Results
 
@@ -652,6 +780,7 @@ At the end of this project the Lunatik ecosystem will gain:
 
 - A reusable `lunatik_bpf_run()` abstraction layer
 - A new luatc binding for Traffic Control
+- A new luasched binding for Linux Extensible Scheduler class
 - A Lua module for interacting with eBPF maps
 - Documentation and working examples demonstrating the system
 
@@ -671,15 +800,17 @@ behavior using Lua.
     table.cell(fill: teal-d)[#text(fill: white, weight: "bold")[Milestones]],
   ),
 
-    [Community Bonding], [Agree on the lunatik_bpf_run callback interface with mentors, set up a test VM with BTF-enabled kernel],
+    [Community Bonding], [Agree on the lunatik_bpf_run interface with mentors, set up a test VM with BTF-enabled kernel],
     [Week 1–2], [Implement core `lunatik_bpf_run()` infrastructure and refactor the
     existing `bpf_luaxdp_run()` implementation to use it],
     [Week 3-5],
     [Implement `luatc` binding and expose `__sk_buff` context to Lua.],
-    [Week 6-9],
-    [Implement eBPF maps Lua module and kernel map access wrappers.],
-    [Week 10-11],
-    [Demo scripts and benchmarks of TC eBPF + Lua.],
+    [Week 6-8],
+    [eBPF maps module.],
+    [Week 9-10],
+    [Implement `luasched` binding and expose `task_struct` context to Lua.],
+    [Week 11],
+    [Benchmarks of eBPF + Lua scripts.],
     [Week 12],
     [Polish, code cleanup, final evaluation.],
 )
@@ -699,12 +830,27 @@ By the midterm evaluation:
 At the end of the project:
 
 - Fully functional luatc module
+- Fully functional luasched module
 - eBPF maps Lua API
 - Examples and documentation
 
 = Future Scope
 
 We can target more subsystems with this generic bpf layer.
+The most natural extensions are 
+- *BPF_PROG_TYPE_CGROUP_SKB* for per-container network policy
+- *BPF_PROG_TYPE_SOCKET_FILTER* for application-layer filtering with dynamic per-socket allow lists.
+- Tracing program types (*BPF_PROG_TYPE_KPROBE*, *BPF_PROG_TYPE_TRACEPOINT*)
+
+Currently changing a Lua policy requires detaching
+the runtime and reloading the script. A hot-reload mechanism via `/dev/lunatik`
+that swaps the handler function in-place, without detaching the eBPF program
+or disrupting live traffic.
+
+The current maps module targets *BPF_MAP_TYPE_HASH*.
+Extending coverage to LRU hash maps (automatic eviction without manual
+cleanup), array maps, and *BPF_MAP_TYPE_RINGBUF* for event streaming would
+significantly expand what Lua policy handlers can express.
 
 = Why This Project
 
