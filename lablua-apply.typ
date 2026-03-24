@@ -1,4 +1,5 @@
 #import "@preview/fletcher:0.5.8" as fletcher: diagram, node, edge
+#show link: underline
 
 #let teal-d = rgb("#0F766E")
 #let ink    = rgb("#0F172A")
@@ -36,10 +37,10 @@
 
   #text(size: 18pt)[LabLua]
 
-  #text(size: 18pt)[Lunatik eBPF Abstraction Layer]
+  #underline[#text(size: 18pt)[Lunatik eBPF Abstraction Layer]]
   #v(0.1cm)
 
-  #text(size: 16pt)[Bindings for Linux Traffic Control (TC), Linux Scheduler and eBPF Maps]
+  #text(size: 16pt)[Bindings for Linux Traffic Control, Scheduler and eBPF Maps]
 
   #v(0.8cm)
 
@@ -59,6 +60,11 @@
 
 #table(
   columns: (35%, 65%),
+
+  stroke: (paint: rgb("#E2E8F0"), thickness: 0.8pt),
+  fill: (_, row) => if calc.odd(row) { light } else { white },
+  inset: (x: 8pt, y: 7pt),
+
   [*Preferred Email*], [ashwanikamal.im421\@gmail.com],
   [*GitHub*], [https://github.com/sneaky-potato/],
   [*Matrix ID*], [\@sneaky-potato:matrix.org],
@@ -148,6 +154,10 @@ on improving the method dispatch mechanism used by Lua objects in the
 kernel runtime. By replacing repeated table lookups with eager closure
 wrapping, I reduced method call overhead from roughly 275ns to 98ns in
 benchmark tests across one million iterations.
+
+Related PRs:
+- #link("https://github.com/luainkernel/lunatik/pull/410")[\#410]: wrap class methods eagerly instead of via \_\_index
+- #link("https://github.com/luainkernel/lunatik/pull/434")[\#434]: add support for non-shared objects in shared class
 
 In addition to Lunatik, I have also contributed patches to the *etcd*
 project, focusing on improving the correctness and determinism of the
@@ -312,7 +322,7 @@ typedef void (*lunatik_bpf_output_cb)(lua_State *L, void *result);
 
 int lunatik_bpf_run(
     const char           *runtime,
-    lunatik_bpf_input_cb  push_ctx,   // pushes input context onto Lua stack
+    lunatik_bpf_input_cb  push_ctx,    // pushes input context onto Lua stack
     void                 *ctx,
     lunatik_bpf_output_cb read_result, // reads output from stack into result
     void                 *result       // caller-allocated result buffer
@@ -438,6 +448,9 @@ sched.attach(handler)    -- register Lua callback
 sched.detach()           -- unregister
 ```
 
+The Lua handler returns two values: {dsq, slice}. `luasched_read_result` reads
+these values into `luasched_resut`.
+
 === eBPF Maps Module
 
 To fully use the bpf ecosystem via Lunatik, we need access to shared kernel
@@ -516,34 +529,34 @@ Both approaches should work, we can discuss which could be better for Lunatik's 
   node-stroke: 1pt,
   spacing: (5em, 3em),
 
-  node((0,0), [Userspace\ (`bin/lunatik`)], corner-radius: 2pt),
-  node((1,0), [Userspace\ (`bpftool`)], corner-radius: 2pt),
+  node((-1,0), [Userspace\ (`bin/lunatik`)], corner-radius: 2pt),
+  node((0,0), [Userspace\ (`bpftool`)], corner-radius: 2pt),
 
-  node((0,1), [`driver:write()`\ process context], corner-radius: 2pt),
-  node((1,2), [bpffs\ `/sys/fs/bpf/*`], corner-radius: 2pt),
+  node((-1,1), [`driver:write()`\ process context], corner-radius: 2pt),
+  node((0,2), [bpffs\ `/sys/fs/bpf/*`], corner-radius: 2pt),
 
-  node((0,2), [Lunatik Runtime\ `ebpf.map` module\ `map*` in Lua userdata], corner-radius: 2pt),
-  node((2,3), [eBPF Program\ (TC / XDP)], corner-radius: 2pt),
+  node((-1,2), [Lunatik Runtime\ `ebpf.map` module\ `map*` in Lua userdata], corner-radius: 2pt),
+  node((1,3), [eBPF Program\ (TC / XDP)], corner-radius: 2pt),
 
-  node((0,3), [Lua Policy Handler\ (softirq)], corner-radius: 2pt),
+  node((-1,3), [Lua Policy Handler\ (softirq)], corner-radius: 2pt),
 
-  node((1,4), [Shared Policy State\ (`ip -> classid`)], corner-radius: 4pt),
+  node((0,4), [Shared Policy State\ (`ip -> classid`)], corner-radius: 4pt),
 
-  edge((0,0), (0,1), "-|>", label: [`/dev/lunatik`], label-side: right),
+  edge((-1,0), (-1,1), "-|>", label: [`/dev/lunatik`], label-side: right),
 
-  edge((1,0), (1,2), "-|>", label: [pinned], label-side: left),
+  edge((0,0), (0,2), "-|>", label: [pinned], label-side: left),
 
-  edge((0,1), (0,2), "-|>", label: [`lunatik_newruntime()`], label-side: right),
+  edge((-1,1), (-1,2), "-|>", label: [`lunatik_newruntime()`], label-side: right),
 
-  edge((0,2), (1,2), "-|>"),
+  edge((-1,2), (0,2), "-|>"),
 
-  edge((0,2), (0,3), "-|>", label: [`tc.attach(handler)`], label-side: right),
+  edge((-1,2), (-1,3), "-|>", label: [`tc.attach(handler)`], label-side: right),
 
-  edge((2,3), (0,3), "-|>", label: [`lunatik_bpf_run()`], label-side: right),
+  edge((1,3), (-1,3), "-|>", label: [`lunatik_bpf_run()`], label-side: right),
 
-  edge((0,3), (1,4), "-|>", label: [`map->ops->map_update_elem`], label-side: right),
+  edge((-1,3), (0,4), "-|>", label: [`map->ops->map_update_elem`], label-side: right),
 
-  edge((2,3), (1,4), "-|>"),
+  edge((1,3), (0,4), "-|>"),
 )
 
 === First Packet Classification
@@ -626,11 +639,9 @@ tc.attach(handler)
 
 === Workload scheduling
 
-Lua should not be invoked on every scheduling decision; it is restricted to
-cold-path classification with results cached in BPF maps. This example will use
-eBPF program invoking Lua for implementing the enqueue logic with the help of
-maps.
-
+This example will use eBPF program invoking Lua for implementing the enqueue 
+logic with the help of maps. Lua should not be invoked on every scheduling decision; 
+it is restricted to cold-path classification with results cached in BPF maps. 
 1. Define queues and dispatch logic
 ```c
 #define DSQ_REALTIME  0
@@ -836,21 +847,27 @@ At the end of the project:
 
 = Future Scope
 
-We can target more subsystems with this generic bpf layer.
+1. *Target more subsystems with generic bpf layer*.
 The most natural extensions are 
 - *BPF_PROG_TYPE_CGROUP_SKB* for per-container network policy
 - *BPF_PROG_TYPE_SOCKET_FILTER* for application-layer filtering with dynamic per-socket allow lists.
 - Tracing program types (*BPF_PROG_TYPE_KPROBE*, *BPF_PROG_TYPE_TRACEPOINT*)
 
-Currently changing a Lua policy requires detaching
-the runtime and reloading the script. A hot-reload mechanism via `/dev/lunatik`
-that swaps the handler function in-place, without detaching the eBPF program
-or disrupting live traffic.
-
-The current maps module targets *BPF_MAP_TYPE_HASH*.
+2. *Add more to Maps module*.
 Extending coverage to LRU hash maps (automatic eviction without manual
 cleanup), array maps, and *BPF_MAP_TYPE_RINGBUF* for event streaming would
 significantly expand what Lua policy handlers can express.
+
+3. *Complete BCC frontend*.
+#link("https://github.com/iovisor/bcc/blob/master/src/lua/bcc/bpf.lua")[BCC]
+supports Python and Lua bindings for loading eBPF programs. At the time of writing
+this document BCC-Lua does not support kfuncs and subsystems other than krobes and tracing.
+Most of the exposed helpers are tracking old libbcc API.
+
+A natural extension of this project could be writing a proper BCC frontend for Lua
+which bridges the proposed plan in this document. This will reduce friction
+of writing separate eBPF programs and enable the user to control everything 
+from Lua.
 
 = Why This Project
 
