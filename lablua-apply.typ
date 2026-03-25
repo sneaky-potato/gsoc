@@ -498,12 +498,9 @@ bpftool map create /sys/fs/bpf/flow_cache type hash key 4 value 4 entries 128 na
 ==== Map Lookup and usage
 
 Map resolution should happen as follows:
-- from userspace we call open(path) to get an fd on the pinned bpffs file (this could happen inside `/bin/lunatik`)
-- now we share this fd to kernel side via the lunatik driver (from `/bin/lunatik` to `/dev/lunatik`)
-- now we can call `bpf_map_get_with_uref(u32 ufd)` from kernel side to resolve the fd to pointer to `struct bpf_map`
-
-The resolved pointer to `struct bpf_map` is stored in a Lua userdata and reused by 
-all subsequent lookup/update/delete calls. These are safe to call from softirq.
+- from userspace we call open(path) to get an fd on the pinned bpffs file.
+- now we share this fd to kernel side
+- we can call `bpf_map_get_with_uref(u32 ufd)` from kernel side to resolve the fd to pointer to `struct bpf_map`
 
 This approach will require adding a userspace bpf helper method to be called from `/bin/lunatik`.
 Hence changes might be required in both `/bin/lunatik` and `driver.lua`
@@ -513,9 +510,10 @@ resolve map pointer directly from bpffs path. We can use `kern_path` to resolve
 the dentry without triggering the open handler, then read `inode->i_private` 
 directly where bpffs stores the pointer to `struct bpf_map`. 
 
-This has been verified via a kernel module POC.
+The resolved pointer to `struct bpf_map` is stored in a Lua userdata and reused by 
+all subsequent lookup/update/delete calls. These are safe to call from softirq.
 
-Both approaches should work, we can discuss which could be better for Lunatik's eBPF long term support.
+This has been verified via a kernel module POC.
 
 - `lookup(key)` on the map pointer will return the value stored in the map for the provided key. We can reuse `luadata` for the actual types.
 - `update(key, data)` on the map pointer will update the map for the provided key with the given data.
@@ -540,7 +538,7 @@ Both approaches should work, we can discuss which could be better for Lunatik's 
 
   node((-1,3), [Lua Policy Handler\ (softirq)], corner-radius: 2pt),
 
-  node((0,4), [Shared Policy State\ (`ip -> classid`)], corner-radius: 4pt),
+  node((0,4), [Shared Policy State], corner-radius: 4pt),
 
   edge((-1,0), (-1,1), "-|>", label: [`/dev/lunatik`], label-side: right),
 
@@ -564,8 +562,8 @@ Both approaches should work, we can discuss which could be better for Lunatik's 
 This demo will use eBPF TC classifier to check if a packet is SNI, then invoke the Lua
 callback and classify the packet and cache the result in a map.
 
-1. Setup TC
-```shell
+1. Setup TC setup with classes for separate rates
+```bash
 tc qdisc del dev eth0 root 2>/dev/null
 tc qdisc add dev eth0 root handle 1: htb default 30
 
@@ -573,7 +571,8 @@ tc class add dev eth0 parent 1: classid 1:10 htb rate 20mbit  # realtime
 tc class add dev eth0 parent 1: classid 1:20 htb rate 10mbit  # streaming
 tc class add dev eth0 parent 1: classid 1:30 htb rate 5mbit   # bulk/default
 
-tc filter add dev eth0 ingress bpf da obj tc.bpf.o sec classifier
+# Attach the below eBPF program on EGRESS
+tc filter add dev eth0 parent 1: bpf da obj tc.bpf.o sec classifier
 ```
 
 2. eBPF program
@@ -609,10 +608,9 @@ local map = require("ebpf.map")
 local cache = map.open("/sys/fs/bpf/flow_cache")
 
 local policy = {
-    ["netflix%.com$"]       = 0x00010030,  -- bulk
     ["meet%.google%.com$"]  = 0x00010010,  -- realtime
     ["%.zoom%.us$"]         = 0x00010010,  -- realtime
-    ["%.backup%.internal$"] = 0x00010040,  -- background
+    ["netflix%.com$"]       = 0x00010020,  -- streaming
 }
 
 local function parse_sni(p)
@@ -669,22 +667,9 @@ void BPF_STRUCT_OPS(luasched_dispatch, s32 cpu, struct task_struct *prev)
 ```c
 extern int bpf_luasched_run(struct task_struct *p, struct luasched_result *result) __ksym;
 
-static char runtime[] = "examples/sched/workload";
-
-struct task_class {
-    __u32 dsq;
-    __u32 slice_ns;
-};
-
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 4096);
-    __type(key, __u32);               /* pid */
-    __type(value, struct task_class);
-} task_classes SEC(".maps");
-
 void BPF_STRUCT_OPS(luasched_enqueue, struct task_struct *p, u64 enq_flags)
 {
+    // task_classes is a eBPF map which stores task_classes keyed by pid
     struct task_class *cls = bpf_map_lookup_elem(&task_classes, &p->pid);
 
     if (!cls) {
@@ -692,12 +677,14 @@ void BPF_STRUCT_OPS(luasched_enqueue, struct task_struct *p, u64 enq_flags)
             .dsq      = DSQ_DEFAULT,
             .slice_ns = SCX_SLICE_DFL,
         };
+        // if no class found, call Lunatik
         bpf_luasched_run(p, &result);
 
         struct task_class new_cls = {
             .dsq      = result.dsq,
             .slice_ns = result.slice_ns,
         };
+        // update the map for future scheduling
         bpf_map_update_elem(&task_classes, &p->pid, &new_cls, BPF_ANY);
         scx_bpf_dispatch(p, result.dsq, result.slice_ns, 0);
         return;
