@@ -410,7 +410,7 @@ tc.detach()           -- unregister
 
 The Lua handler returns a single integer, the TC verdict. `luatc_read_result`
 reads `lua_tointeger(L, -1)`, making the output path as thin as possible while
-remaining consistent with the generic interface used by all subsytems.
+remaining consistent with the generic interface used by all subsystems.
 
 === Scheduler Binding (luasched)
 
@@ -449,7 +449,7 @@ sched.detach()           -- unregister
 ```
 
 The Lua handler returns two values: {dsq, slice}. `luasched_read_result` reads
-these values into `luasched_resut`.
+these values into `luasched_result`.
 
 === eBPF Maps Module
 
@@ -497,7 +497,7 @@ bpftool map create /sys/fs/bpf/flow_cache type hash key 4 value 4 entries 128 na
 
 ==== Map Lookup and usage
 
-Map resolution should happen as follows:
+Map resolution normally happens as follows:
 - from userspace we call open(path) to get an fd on the pinned bpffs file.
 - now we share this fd to kernel side
 - we can call `bpf_map_get_with_uref(u32 ufd)` from kernel side to resolve the fd to pointer to `struct bpf_map`
@@ -510,10 +510,10 @@ resolve map pointer directly from bpffs path. We can use `kern_path` to resolve
 the dentry without triggering the open handler, then read `inode->i_private` 
 directly where bpffs stores the pointer to `struct bpf_map`. 
 
+This has been verified via a kernel module POC.
+
 The resolved pointer to `struct bpf_map` is stored in a Lua userdata and reused by 
 all subsequent lookup/update/delete calls. These are safe to call from softirq.
-
-This has been verified via a kernel module POC.
 
 - `lookup(key)` on the map pointer will return the value stored in the map for the provided key. We can reuse `luadata` for the actual types.
 - `update(key, data)` on the map pointer will update the map for the provided key with the given data.
@@ -735,8 +735,7 @@ I have tried writing a TC implementation similar to XDP in
 
 I evaluated two scenarios:
 - A pure eBPF program returning `TC_ACT_OK` for each packet (baseline fast path)
-- An eBPF program invoking `bpf_luatc_run`, which executes a Lua script returning 
-`tc.action.OK`
+- An eBPF program invoking `bpf_luatc_run`, which executes a Lua script returning `tc.action.OK`
 
 I attached the following kprobe (this will measure the latency to _classify_
 packets) to measure latency in both the cases.
@@ -831,6 +830,14 @@ At the end of the project:
 - Fully functional luasched module
 - eBPF maps Lua API
 - Examples and documentation
+
+= Risks
+
+While the full scope is achievable, the project is structured so that each
+subsystem builds incrementally on the previous one.
+The `lunatik_bpf_run` and `luatc` bindings serve as the primary production-ready 
+deliverables, and subsequent component (`luasched`) reuse the same infrastructure, 
+ensuring partial progress always results in usable contributions.
 
 = Future Scope
 
