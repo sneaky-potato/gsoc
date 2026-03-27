@@ -728,6 +728,20 @@ sched.attach(function(task)
 end)
 ```
 
+=== Stretch Goal: BCC integration
+
+The proposed plan makes eBPF and Lua complementary. The layer involving
+eBPF cannot be entirely replaced but we could think of generating the necessary
+eBPF program via Lua through BPF Compiler Collection (#link("https://github.com/iovisor/bcc")[BCC]).
+
+There are existing BCC/Lua bindings but they mostly use old `libbcc` library and will require changes
+to be able to generate the needed kfuncs. Also these bindings target tracing subsystems like kprobe.
+
+If the deliverables mentioned in this proposal are ready before time, we
+could start digging into exisitng BCC support for Lua and potentially extending it
+for Lunatik's use case. The big picture is to give the user an option to write 
+eBPF programs via Lua bindings.
+
 == Benchmarks and Evaluation
 
 I have tried writing a TC implementation similar to XDP in
@@ -836,7 +850,7 @@ At the end of the project:
 While the full scope is achievable, the project is structured so that each
 subsystem builds incrementally on the previous one.
 The `lunatik_bpf_run` and `luatc` bindings serve as the primary production-ready 
-deliverables, and subsequent component (`luasched`) reuse the same infrastructure, 
+deliverables, and subsequent component (`luasched`) reuses the same infrastructure, 
 ensuring partial progress always results in usable contributions.
 
 = Future Scope
